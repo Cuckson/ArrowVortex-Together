@@ -19,6 +19,7 @@ class DialogPreviewSettings : public EditorDialog {
     int drawMode_;
     int cmod_;
     double xmod_;
+    double bgOpacity_;
     bool isBeatLines_;
     bool isReverse_;
     bool isFakeNotes_;

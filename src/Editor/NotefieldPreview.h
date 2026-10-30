@@ -22,6 +22,9 @@ struct NotefieldPreview {
     virtual void setGuideXMod(double value) = 0;
     virtual double getGuideXMod() = 0;
 
+    virtual void setBgOpacity(double percent) = 0;
+    virtual double getBgOpacity() = 0;
+
     virtual void setMode(DrawMode mode) = 0;
     virtual void setMode(int mode) = 0;
     virtual DrawMode getMode() = 0;

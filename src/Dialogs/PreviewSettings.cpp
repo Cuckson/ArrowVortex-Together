@@ -14,7 +14,8 @@ enum Actions {
     ACT_CMOD_VALUE,
     ACT_XMOD_TOGGLE,
     ACT_XMOD_VALUE,
-    ACT_CROP_TOGGLE
+    ACT_CROP_TOGGLE,
+    ACT_BG_OPACITY
 };
 
 DialogPreviewSettings::~DialogPreviewSettings() = default;
@@ -116,6 +117,27 @@ void DialogPreviewSettings::myCreateWidgets() {
     check->onChange.bind(this, &DialogPreviewSettings::onAction,
                          static_cast<int>(ACT_CROP_TOGGLE));
     check->setTooltip("If enabled, notes past the view line are hidden");
+
+    myLayout.row().col(194);
+    myLayout.add<WgSeperator>();
+    myLayout.row().col(64).col(70).col(56);
+
+    WgSlider* slider = myLayout.add<WgSlider>("BG Opacity");
+    slider->value.bind(&bgOpacity_);
+    slider->setRange(0.0, 100.0);
+    slider->onChange.bind(this, &DialogPreviewSettings::onAction,
+                          static_cast<int>(ACT_BG_OPACITY));
+    slider->setTooltip(
+        "Opacity of the black background behind the preview (100% = solid "
+        "black)");
+
+    WgSpinner* opacity = myLayout.add<WgSpinner>();
+    opacity->value.bind(&bgOpacity_);
+    opacity->setPrecision(0, 0);
+    opacity->setRange(0.0, 100.0);
+    opacity->setStep(5.0);
+    opacity->onChange.bind(this, &DialogPreviewSettings::onAction,
+                           static_cast<int>(ACT_BG_OPACITY));
 }
 
 void DialogPreviewSettings::onTick() {
@@ -130,6 +152,7 @@ void DialogPreviewSettings::onTick() {
     isXModEnabled_ = gNotefieldPreview->hasGuideXMod();
     xmod_ = gNotefieldPreview->getGuideXMod();
     isNotesCropped_ = gNotefieldPreview->hasGuideCrop();
+    bgOpacity_ = gNotefieldPreview->getBgOpacity();
     EditorDialog::onTick();
 }
 
@@ -167,6 +190,9 @@ void DialogPreviewSettings::onAction(int id) {
         } break;
         case ACT_CROP_TOGGLE: {
             gNotefieldPreview->toggleGuideCrop();
+        } break;
+        case ACT_BG_OPACITY: {
+            gNotefieldPreview->setBgOpacity(bgOpacity_);
         } break;
     }
 }

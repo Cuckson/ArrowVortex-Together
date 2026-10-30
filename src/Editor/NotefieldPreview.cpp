@@ -114,6 +114,8 @@ struct NotefieldPreviewImpl : public NotefieldPreview {
     double guideXMod_ = 4.5;
     int guideHeight_ = 0;
 
+    double bgOpacity_ = 50.0;
+
     bool transFakeNotes_ = true, transFakeRegions_ = true;
 
     bool enabled_ = false;
@@ -160,6 +162,8 @@ struct NotefieldPreviewImpl : public NotefieldPreview {
             preview->get("useXMOD", &guideXModEnabled_);
             preview->get("cmod", &guideCMod_);
             preview->get("xmod", &guideXMod_);
+            preview->get("bgOpacity", &bgOpacity_);
+            bgOpacity_ = std::clamp(bgOpacity_, 0.0, 100.0);
 
             const char* mode = preview->get("mode");
             if (mode) drawMode_ = ToMode(mode);
@@ -180,6 +184,7 @@ struct NotefieldPreviewImpl : public NotefieldPreview {
         preview->addAttrib("useXMOD", guideXModEnabled_);
         preview->addAttrib("cmod", static_cast<long>(guideCMod_));
         preview->addAttrib("xmod", static_cast<double>(guideXMod_));
+        preview->addAttrib("bgOpacity", bgOpacity_);
         preview->addAttrib("mode", ToString(drawMode_));
     }
 
@@ -225,7 +230,9 @@ struct NotefieldPreviewImpl : public NotefieldPreview {
         }
 
         recti view = gView->getRect();
-        Draw::fill({myX, view.y, myW, view.h}, RGBAtoColor32(0, 0, 0, 128));
+        int bgAlpha = static_cast<int>(lround(bgOpacity_ * 2.55));
+        Draw::fill({myX, view.y, myW, view.h},
+                   RGBAtoColor32(0, 0, 0, std::clamp(bgAlpha, 0, 255)));
 
         if (beatlines_) drawBeatLines();
         drawReceptors();
@@ -521,6 +528,11 @@ struct NotefieldPreviewImpl : public NotefieldPreview {
 
     void setGuideXMod(double value) override { guideXMod_ = value; }
     double getGuideXMod() override { return guideXMod_; }
+
+    void setBgOpacity(double percent) override {
+        bgOpacity_ = std::clamp(percent, 0.0, 100.0);
+    }
+    double getBgOpacity() override { return bgOpacity_; }
 
     void setMode(DrawMode mode) override {
         drawMode_ = mode;
