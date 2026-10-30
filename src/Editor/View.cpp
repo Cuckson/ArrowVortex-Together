@@ -885,6 +885,8 @@ struct ViewImpl : public View, public InputHandler {
                     case SNAP_DOWN:
                         dir = SNAP_UP;
                         break;
+                    default:
+                        break;
                 };
             }
 

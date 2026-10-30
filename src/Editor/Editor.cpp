@@ -1,13 +1,11 @@
 #include <Editor/Editor.h>
 
-#include <map>
-#include <format>
-
 #include <Core/Xmr.h>
 #include <Core/Gui.h>
 #include <Core/Draw.h>
 #include <Core/Shader.h>
 #include <Core/StringUtils.h>
+#include <Core/FontManager.h>
 
 #include <System/System.h>
 #include <System/File.h>
@@ -17,7 +15,6 @@
 #include <Editor/Menubar.h>
 #include <Editor/Action.h>
 #include <Editor/Shortcuts.h>
-
 #include <Editor/View.h>
 #include <Editor/Notefield.h>
 #include <Editor/NotefieldPreview.h>
@@ -61,7 +58,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <format>
 #include <fstream>
+#include <map>
 
 #include <SDL3/SDL.h>
 
@@ -76,7 +75,6 @@ struct DialogEntry {
     bool requestOpen;
 };
 
-#define LOAD_FILTERS_COUNT 9
 static SDL_DialogFileFilter loadFilters[] = {
     {"Supported Media (*.sm, *.ssc, *.dwi, *.osu, *.ogg, *.mp3, *.wav)",
      "sm;ssc;dwi;osu;ogg;mp3;wav"},
@@ -89,13 +87,25 @@ static SDL_DialogFileFilter loadFilters[] = {
     {"Waveform (*.wav)", "wav"},
     {"All Files (*.*)", "*"},
 };
+constexpr int LOAD_FILTERS_COUNT = SDL_arraysize(loadFilters);
 
-#define SAVE_FILTERS_COUNT 5
 static SDL_DialogFileFilter saveFilters[] = {
     {"Stepmania/ITG (*.sm)", "sm"}, {"Stepmania 5 (*.ssc)", "ssc"},
     {"Osu!mania (*.osu)", "osu"},   {"Dance With Intensity (*.dwi)", "dwi"},
     {"All Files (*.*)", "*"},
 };
+
+static const int NUM_ICONS = 20;
+static const char* iconNames[NUM_ICONS] = {
+    "up one",      "up half",        "down one",       "down half", "halve",
+    "double",      "full selection", "half selection", "undo",      "redo",
+    "calculate",   "tweak",          "search",         "copy",      "play",
+    "arrow right", "folder",         "trash",          "keyboard",  "mouse"};
+
+constexpr int SAVE_FILTERS_COUNT = SDL_arraysize(saveFilters);
+static SDL_DialogFileFilter saveOrderedFilters[SAVE_FILTERS_COUNT];
+static int saveFiltersOrder[SAVE_FILTERS_COUNT];
+
 struct DialogSegment {
     Segment::Type type;
     int row;
@@ -114,6 +124,22 @@ static std::string ClipboardGet() { return gSystem->getClipboardText(); }
 
 static void ClipboardSet(std::string text) { gSystem->setClipboardText(text); }
 
+static void ReorderSaveFilters(int selected) {
+    int n = 0;
+    if (selected >= 0 && selected < SAVE_FILTERS_COUNT)
+        saveFiltersOrder[n++] = selected;
+    for (int i = 0; i < SAVE_FILTERS_COUNT; i++)
+        if (i != selected) saveFiltersOrder[n++] = i;
+    for (int i = 0; i < SAVE_FILTERS_COUNT; i++)
+        saveOrderedFilters[i] = saveFilters[saveFiltersOrder[i]];
+}
+
+int GetSaveFilterIndex(const char* ext) {
+    for (int i = 0; i < SAVE_FILTERS_COUNT; i++)
+        if (strcmp(ext, saveFilters[i].pattern) == 0) return i;
+    return -1;
+}
+
 static const char* ToString(BackgroundStyle style) {
     if (style == BG_STYLE_LETTERBOX) return "letterbox";
     if (style == BG_STYLE_CROP) return "crop";
@@ -130,6 +156,7 @@ static const char* ToString(SimFormat format) {
     if (format == SIM_SM) return "sm";
     if (format == SIM_SSC) return "ssc";
     if (format == SIM_OSU) return "osu";
+    if (format == SIM_DWI) return "dwi";
     return "none";
 }
 
@@ -137,6 +164,7 @@ static SimFormat ToSimFormat(const std::string& str) {
     if (str == "sm") return SIM_SM;
     if (str == "ssc") return SIM_SSC;
     if (str == "osu") return SIM_OSU;
+    if (str == "dwi") return SIM_DWI;
     return SIM_NONE;
 }
 
@@ -230,6 +258,17 @@ struct EditorImpl : public Editor, public InputHandler {
         text.textColor = Colors::white;
         text.shadowColor = RGBAtoColor32(0, 0, 0, 128);
         text.makeDefault();
+
+        // Load text glyphs.
+        Texture icons[NUM_ICONS];
+        Texture::createTiles("assets/icons text.png", 64, 64, NUM_ICONS, icons,
+                             false, Texture::ALPHA);
+        int tex_size = 16;
+        for (int i = 0; i < NUM_ICONS; ++i) {
+            Text::createGlyph(iconNames[i], icons[i], 0, tex_size / 4 - 1, 0,
+                              tex_size, tex_size);
+        }
+        FontManager::updateSpecialGlyphs();
 
         // Create the text overlay, so other editor components can show HUD
         // messages.
@@ -362,22 +401,22 @@ struct EditorImpl : public Editor, public InputHandler {
             if (bgStyle) myBackgroundStyle = ToBackgroundStyle(bgStyle);
         }
 
-        XmrNode* interface = settings.child("interface");
-        if (interface) {
-            interface->get("fontSize", &myFontSize);
+        XmrNode* xmr_interface = settings.child("interface");
+        if (xmr_interface) {
+            xmr_interface->get("fontSize", &myFontSize);
 
-            fs::path path = fs::path(interface->get("fontPath"));
+            fs::path path = fs::path(xmr_interface->get("fontPath"));
             if (std::ifstream testPath(path.c_str());
                 !path.empty() && testPath.good())
                 myFontPath = pathToUtf8(path);
 
             bool winMax = false;
-            interface->get("windowMaximized", &winMax);
+            xmr_interface->get("windowMaximized", &winMax);
             if (winMax)
                 gSystem->setWindowState(true);
             else {
                 int winSize[2] = {0, 0};
-                if (interface->get("windowSize", winSize, 2)) {
+                if (xmr_interface->get("windowSize", winSize, 2)) {
                     vec2i size = {winSize[0], winSize[1]};
                     gSystem->setWindowSize(size);
                 }
@@ -399,18 +438,20 @@ struct EditorImpl : public Editor, public InputHandler {
 
         view->addAttrib("backgroundStyle", ToString(myBackgroundStyle));
 
-        XmrNode* interface = settings.addChild("interface");
+        XmrNode* xmr_interface = settings.addChild("interface");
 
-        interface->addAttrib("fontPath", myFontPath.c_str());
-        interface->addAttrib("fontSize", static_cast<long>(myFontSize));
+        xmr_interface->addAttrib("fontPath", myFontPath.c_str());
+        xmr_interface->addAttrib("fontSize", static_cast<long>(myFontSize));
 
         bool windowState = gSystem->getWindowState();
         if (windowState) {
-            interface->addAttrib("windowMaximized", true);
+            xmr_interface->addAttrib("windowMaximized", true);
         } else {
             vec2i ws = gSystem->getWindowSize();
+            // getWindowSize is usable window, not true window, so adjust
+            if (gMenubar) ws.y += gMenubar->getMenubarHeight();
             long windowSize[] = {ws.x, ws.y};
-            interface->addAttrib("windowSize", windowSize, 2);
+            xmr_interface->addAttrib("windowSize", windowSize, 2);
         }
     }
 
@@ -611,62 +652,43 @@ struct EditorImpl : public Editor, public InputHandler {
 
         // If the path is empty, ask a path from the user.
         if (save_path.empty() || showSaveAsDialog) {
+            saveFmt = gSimfile->get()->format;
+
             // Set the default filter index based on the save format.
-            // SDL doesn't support this currently.
-            int filterIndex;
-            switch (saveFmt) {
-                default:
-                case SIM_SM:
-                    filterIndex = 0;
-                    break;
-                case SIM_SSC:
-                    filterIndex = 1;
-                    break;
-                case SIM_OSU:
-                    filterIndex = 2;
-                    break;
-                case SIM_DWI:
-                    filterIndex = 3;
-                    break;
-            };
+            // SDL doesn't support this, so reorder the filters themselves.
+            int filterIndex = GetSaveFilterIndex(ToString(saveFmt));
+            ReorderSaveFilters(filterIndex);
+
+            // Defaults Filename
+            fs::path defaultName = fs::path(file);
+            defaultName.replace_extension("");
 
             // Show the save file dialog.
-            save_path = gSystem->saveFileDlg("Save file", saveFilters,
+            save_path = gSystem->saveFileDlg("Save file", saveOrderedFilters,
                                              SAVE_FILTERS_COUNT, &filterIndex,
-                                             fs::path());
+                                             defaultName);
+            if (save_path.empty()) return false;
+
             dir = pathToUtf8(save_path.parent_path());
             file = pathToUtf8(save_path.filename());
             auto ext = pathToUtf8(save_path.extension());
 
-            if (save_path.empty()) return false;
+            // Update the save format based on user provided file extension.
+            saveFmt = !ext.empty() ? ToSimFormat(ext.substr(1)) : SIM_NONE;
 
             // Update the save format based on the selected filter index.
-            // SDL3 returns 0-based filter indices (getFilterIndex subtracts 1).
-            switch (filterIndex) {
-                case 0:
-                    saveFmt = SIM_SM;
-                    break;
-                case 1:
-                    saveFmt = SIM_SSC;
-                    break;
-                case 2:
-                    saveFmt = SIM_OSU;
-                    break;
-                case 3:
-                    saveFmt = SIM_DWI;
-                    break;
-                default:
-                    if (ext == ".ssc") {
-                        saveFmt = SIM_SSC;
-                    } else if (ext == ".osu") {
-                        saveFmt = SIM_OSU;
-                    } else if (ext == ".dwi") {
-                        saveFmt = SIM_DWI;
-                    } else {
-                        saveFmt = SIM_SM;
-                    }
-                    break;
-            };
+            // Only when the file extension wasn't a valid sim format.
+            if (filterIndex >= 0 && filterIndex < SAVE_FILTERS_COUNT - 1) {
+                auto selectedFilter = saveFiltersOrder[filterIndex];
+                saveFmt = ToSimFormat(saveFilters[selectedFilter].pattern);
+            }
+
+            // Selected Filter is invalid ("All Files"), use the chart format.
+            if (saveFmt == SIM_NONE) saveFmt = gSimfile->get()->format;
+
+            // First time saving an audio file, didn't provide an extension or
+            // format filter, then save it as the default format.
+            if (saveFmt == SIM_NONE) saveFmt = myDefaultSaveFormat[0];
 
             // Save the simfile.
             if (!gSimfile->save(dir, file, saveFmt)) {
@@ -789,8 +811,10 @@ struct EditorImpl : public Editor, public InputHandler {
         auto coords = gView->getNotefieldCoords();
         int offset =
             gTempoBoxes->getStackWidth(meta->side, mySegmentEditor.row);
-        int x = meta->side ? coords.xr + offset + 16
-                           : coords.xl - offset - 10 - dlg->getFixedWidth();
+        int x = meta->side
+                    ? coords.xr + offset + gSystem->applyScaleFactor(16)
+                    : coords.xl - offset -
+                          gSystem->applyScaleFactor(10 + dlg->getFixedWidth());
         int y =
             gView->rowToY(mySegmentEditor.row) - (dlg->getFixedHeight() / 2);
 
@@ -859,6 +883,7 @@ struct EditorImpl : public Editor, public InputHandler {
                 break;
             case DIALOG_COLLABORATE:
                 dlg = new DialogCollaborate;
+            default:
                 break;
         };
 
@@ -910,6 +935,11 @@ struct EditorImpl : public Editor, public InputHandler {
                 }
             }
         }
+    }
+
+    void onWindowRescale() override {
+        FontManager::updateSpecialGlyphs();
+        gTempoBoxes->onChanges(VCM_TEMPO_CHANGED);
     }
 
     void onMenuAction(int id) override {

@@ -174,7 +174,7 @@ bool Action::perform(Type action) {
             break;
         }
         case EDIT_DELETE: {
-            gSystem->getEvents().addKeyPress(Key::DELETE, 0, false);
+            gSystem->getEvents().addKeyPress(Key::DELETE_KEY, 0, false);
             break;
         }
         case SELECT_ALL: {
