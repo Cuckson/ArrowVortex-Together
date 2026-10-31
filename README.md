@@ -9,6 +9,8 @@ It is up to date with the 1.1.0 release version of ArrowVortex with some extra f
 - Hosting Sessions to invite friends to step together
 - Custom Snaps saved to your list of snaps and allows multiple Custom Snaps added at once.
 
+
+
 ArrowVortex is a dance game simfile editor. It can be used to create or edit stepfiles for various rhythm games, such as StepMania, ITG, osu!, and other games which support DDR-style and/or PIU-style panel layouts.
 
 This is a continuation of the original project by Bram 'Fietsemaker' van de Wetering. He has graciously allowed for the open sourcing of this code so that development can continue.
