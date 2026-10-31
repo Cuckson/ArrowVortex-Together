@@ -1,9 +1,13 @@
 name: Multiplayer Release
 
-# Clean Release builds of the multiplayer fork for Windows, Linux and macOS.
-# Run manually from the Actions tab; the builds are attached to a draft
+# Clean Release builds of the multiplayer fork for Windows and Linux.
+# Pushing a tag like v1.1.0-mp1 starts it (or run it manually from the
+# Actions tab); the builds are attached to a draft
 # GitHub release so nothing goes public until it is published by hand.
 on:
+  push:
+    tags:
+      - "v*-mp*"
   workflow_dispatch:
     inputs:
       tag:
@@ -13,6 +17,7 @@ on:
 env:
   # No shared binary cache: every dependency is built from source.
   VCPKG_BINARY_SOURCES: "clear"
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   windows:
@@ -88,51 +93,9 @@ jobs:
           path: ArrowVortex-linux-x64.tar.gz
           if-no-files-found: error
 
-  macos:
-    name: "Build macOS ${{ matrix.name }}"
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: arm64
-            runner: macos-latest
-            triplet: arm64-osx
-            preset: macos-release
-          - name: x64
-            runner: macos-26-intel
-            triplet: x64-osx
-            preset: macos-intel-release
-    steps:
-      - name: Get AV
-        uses: actions/checkout@v4
-      - name: Install dependent packages
-        run: brew install pkg-config sdl3 nasm
-      - name: Configure CMake
-        run: >
-          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
-          -DPRESET_NAME=${{ matrix.preset }}
-          -DYML=YML
-      - name: Build AV
-        run: cmake --build build --config Release --parallel $(sysctl -n hw.ncpu)
-      - name: Package
-        # ditto keeps the executable bit, which upload-artifact drops.
-        run: |
-          cmake --install build --config Release --prefix ./
-          ditto -c -k --keepParent ArrowVortex.app ArrowVortex-macos-${{ matrix.name }}.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.name }}
-          path: ArrowVortex-macos-${{ matrix.name }}.zip
-          if-no-files-found: error
-
   release:
     name: "Draft release"
-    needs: [windows, linux, macos]
+    needs: [windows, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -143,8 +106,8 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
+          tag_name: ${{ env.RELEASE_TAG }}
           target_commitish: ${{ github.sha }}
-          name: ArrowVortex Together ${{ inputs.tag }}
+          name: ArrowVortex Together ${{ env.RELEASE_TAG }}
           draft: true
           files: dist/*
