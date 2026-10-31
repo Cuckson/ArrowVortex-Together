@@ -1,0 +1,150 @@
+name: Multiplayer Release
+
+# Clean Release builds of the multiplayer fork for Windows, Linux and macOS.
+# Run manually from the Actions tab; the builds are attached to a draft
+# GitHub release so nothing goes public until it is published by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.1.0-mp1)"
+        required: true
+
+env:
+  # No shared binary cache: every dependency is built from source.
+  VCPKG_BINARY_SOURCES: "clear"
+
+jobs:
+  windows:
+    name: "Build Windows x64"
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - name: Get AV
+        uses: actions/checkout@v4
+      - name: Configure CMake
+        run: >
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+          -DYML=YML
+      - name: Build AV
+        run: cmake --build build --config Release --parallel "$env:NUMBER_OF_PROCESSORS"
+      - name: Package
+        shell: pwsh
+        run: |
+          cmake --install build --config Release --prefix ./
+          New-Item -ItemType Directory pkg/ArrowVortex | Out-Null
+          Copy-Item -Recurse bin/assets, bin/noteskins, bin/settings, bin/ArrowVortex.exe pkg/ArrowVortex/
+          Compress-Archive pkg/ArrowVortex ArrowVortex-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ArrowVortex-windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    name: "Build Linux x64"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Get AV
+        uses: actions/checkout@v4
+      - name: Install dependent packages
+        run: |
+          sudo apt-get update &&
+          sudo apt-get install -qq -y nasm libltdl-dev \
+            autoconf autoconf-archive automake libtool \
+            libx11-dev libxft-dev libxext-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev \
+            libibus-1.0-dev zenity clang-tidy build-essential git \
+            pkg-config cmake ninja-build libasound2-dev libpulse-dev \
+            libaudio-dev libjack-dev libsndio-dev libusb-1.0-0-dev \
+            libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libdbus-1-dev fcitx-libs-dev libdecor-0-dev python3-venv \
+            libthai-dev libpipewire-0.3-dev liburing-dev
+      - name: Configure CMake
+        run: >
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-linux
+          -DPRESET_NAME=linux-release
+          -DYML=YML
+      - name: Build AV
+        run: cmake --build build --config Release --parallel $(nproc)
+      - name: Package
+        # tar keeps the executable bit, which upload-artifact drops.
+        run: |
+          cmake --install build --config Release --prefix ./
+          mkdir -p pkg/ArrowVortex
+          cp -r bin/assets bin/noteskins bin/settings bin/ArrowVortex pkg/ArrowVortex/
+          tar -C pkg -czf ArrowVortex-linux-x64.tar.gz ArrowVortex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ArrowVortex-linux-x64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: "Build macOS ${{ matrix.name }}"
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64
+            runner: macos-latest
+            triplet: arm64-osx
+            preset: macos-release
+          - name: x64
+            runner: macos-26-intel
+            triplet: x64-osx
+            preset: macos-intel-release
+    steps:
+      - name: Get AV
+        uses: actions/checkout@v4
+      - name: Install dependent packages
+        run: brew install pkg-config sdl3 nasm
+      - name: Configure CMake
+        run: >
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+          -DPRESET_NAME=${{ matrix.preset }}
+          -DYML=YML
+      - name: Build AV
+        run: cmake --build build --config Release --parallel $(sysctl -n hw.ncpu)
+      - name: Package
+        # ditto keeps the executable bit, which upload-artifact drops.
+        run: |
+          cmake --install build --config Release --prefix ./
+          ditto -c -k --keepParent ArrowVortex.app ArrowVortex-macos-${{ matrix.name }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.name }}
+          path: ArrowVortex-macos-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  release:
+    name: "Draft release"
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ArrowVortex Together ${{ inputs.tag }}
+          draft: true
+          files: dist/*
