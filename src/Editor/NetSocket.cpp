@@ -409,6 +409,10 @@ bool NetSocket::openUdp(int port, std::string& error) {
                reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
     setsockopt(ToNative(myHandle), SOL_SOCKET, SO_SNDBUF,
                reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
+    // Guests broadcast to find a host on the LAN.
+    int broadcast = 1;
+    setsockopt(ToNative(myHandle), SOL_SOCKET, SO_BROADCAST,
+               reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
 
     sockaddr_in addr = ToSockAddr({0, static_cast<uint16_t>(port)});
     if (bind(ToNative(myHandle), reinterpret_cast<sockaddr*>(&addr),

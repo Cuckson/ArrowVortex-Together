@@ -10,9 +10,10 @@ namespace Vortex {
 
 /// Peer-to-peer co-editing session between one host and any number of guests.
 ///
-/// The host shares a join code that holds its LAN and public addresses (found
+/// The host shares a short join code that holds its public address (found
 /// with STUN; the port is forwarded with UPnP when the router allows it).
-/// Guests try all of them directly; if none works, the guest shows a reply
+/// Guests on the same LAN find the host by broadcast; others try the public
+/// address directly. If that fails, the guest shows a reply
 /// code that the host enters, and both sides punch a hole through their
 /// routers over UDP. The host relays every change to
 /// the other guests. When a guest joins, its simfile is replaced by the host's

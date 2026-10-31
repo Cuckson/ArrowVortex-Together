@@ -69,6 +69,9 @@ class UdpStream {
         KIND_ACK = 4,     ///< body: u32 next expected seq, u8 n, n x [u32
                           ///< first, u16 count] segments received after it.
         KIND_CLOSE = 5,   ///< body: none.
+        /// body: u32 session token. Guests broadcast it to find a host on
+        /// the LAN; the host answers with connection 0.
+        KIND_DISCOVER = 6,
     };
 
     static const uint8_t UDP_MAGIC = 0xA7;
@@ -79,11 +82,13 @@ class UdpStream {
     static bool parseHeader(const uint8_t* data, int size, Kind& kind,
                             uint32_t& connection);
 
-    /// Sends a datagram without body (or with a u32 body, for punches).
+    /// Sends a datagram without body (or with a u32 token body, for punches
+    /// and discovery).
     static void sendControl(NetSocket& socket, const NetEndpoint& to, Kind kind,
                             uint32_t connection);
     static void sendPunch(NetSocket& socket, const NetEndpoint& to,
-                          uint32_t connection, uint32_t token);
+                          uint32_t connection, uint32_t token,
+                          Kind kind = KIND_PUNCH);
 
     UdpStream(uint32_t connection, const NetEndpoint& peer);
 

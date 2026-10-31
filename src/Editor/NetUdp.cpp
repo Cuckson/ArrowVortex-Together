@@ -173,7 +173,7 @@ bool StunClient::onPacket(const uint8_t* data, int size,
 bool UdpStream::parseHeader(const uint8_t* data, int size, Kind& kind,
                             uint32_t& connection) {
     if (size < HEADER_SIZE || data[0] != UDP_MAGIC) return false;
-    if (data[1] < KIND_PUNCH || data[1] > KIND_CLOSE) return false;
+    if (data[1] < KIND_PUNCH || data[1] > KIND_DISCOVER) return false;
     kind = static_cast<Kind>(data[1]);
     connection = ReadU32(data + 2);
     return true;
@@ -187,9 +187,9 @@ void UdpStream::sendControl(NetSocket& socket, const NetEndpoint& to, Kind kind,
 }
 
 void UdpStream::sendPunch(NetSocket& socket, const NetEndpoint& to,
-                          uint32_t connection, uint32_t token) {
+                          uint32_t connection, uint32_t token, Kind kind) {
     uint8_t packet[HEADER_SIZE + 4];
-    WriteHeader(packet, KIND_PUNCH, connection);
+    WriteHeader(packet, kind, connection);
     WriteU32(packet + HEADER_SIZE, token);
     socket.sendTo(packet, sizeof(packet), to);
 }

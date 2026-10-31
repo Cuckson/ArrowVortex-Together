@@ -119,6 +119,8 @@ const int PUNCH_DELAY_MS = 1500;
 const int PUNCH_INTERVAL_MS = 250;
 const int PUNCH_TIMEOUT_MS = 10 * 60 * 1000;
 const int JOIN_CODE_WAIT_MS = 8000;
+const int DISCOVER_INTERVAL_MS = 300;
+const int DISCOVER_TIME_MS = 1500;
 const int PRESENCE_INTERVAL_MS = 33;
 const int SELECTION_INTERVAL_MS = 100;
 
@@ -537,232 +539,116 @@ static double PixelsPerUnit() {
 // ================================================================================================
 // Join and reply codes.
 //
-// A join code tells a guest how to reach the host: the host's LAN addresses,
-// its public address (as seen by a STUN server, and the port forwarded by
-// UPnP, if any) and a random session token. If the guest cannot connect
-// directly, it shows a reply code with its own public address; once the host
-// enters it, both sides send UDP packets to each other until the routers let
-// them through ("hole punching").
+// A join code tells a guest how to reach the host from the internet: one
+// public address (the port forwarded by UPnP, or else the host's UDP socket
+// as seen by a STUN server) and a random session token. Guests on the same
+// LAN find the host by broadcasting the token instead. If the guest cannot
+// connect directly, it shows a reply code with its own public address; once
+// the host enters it, both sides send UDP packets to each other until the
+// routers let them through ("hole punching").
 //
-// Code bytes: [u8 kind][u8 version][payload][u8 checksum], written as
-// Crockford base32 in dash-separated groups. Values are big-endian.
+// Code bits, most significant first: [3 version][1 kind][20 token][32 ip]
+// [16 port][8 checksum], 80 bits written as 16 Crockford base32 characters
+// in groups of four.
 
 enum CodeKind : uint8_t {
-    CODE_JOIN = 1,
-    CODE_REPLY = 2,
+    CODE_JOIN = 0,
+    CODE_REPLY = 1,
 };
 
-const uint8_t CODE_VERSION = 1;
-const size_t MAX_CODE_ADDRESSES = 6;
+const uint8_t CODE_VERSION = 2;
+const int CODE_BYTES = 10;
+const int CODE_CHARS = CODE_BYTES * 8 / 5;
+const int TOKEN_BITS = 20;
+const uint32_t TOKEN_MASK = (1u << TOKEN_BITS) - 1;
 const char* const CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-struct JoinCode {
+struct SessionCode {
     uint32_t token = 0;
-    uint16_t port = 0;          // Local TCP/UDP port of the host.
-    NetEndpoint stun;           // Public address of the host's UDP socket.
-    NetEndpoint upnp;           // Router address and forwarded port.
-    std::vector<uint32_t> lan;  // Local addresses of the host.
+    // Join: where to reach the host from the internet (ip 0 if unknown; the
+    // port is then the host's local port). Reply: the public address of the
+    // guest's UDP socket.
+    NetEndpoint address;
 };
 
-struct ReplyCode {
-    uint32_t token = 0;
-    uint16_t port = 0;          // Local UDP port of the guest.
-    NetEndpoint stun;           // Public address of the guest's UDP socket.
-    std::vector<uint32_t> lan;  // Local addresses of the guest.
-};
+static std::string EncodeCode(CodeKind kind, const SessionCode& code) {
+    uint64_t bits = (static_cast<uint64_t>(CODE_VERSION) << 53) |
+                    (static_cast<uint64_t>(kind) << 52) |
+                    (static_cast<uint64_t>(code.token & TOKEN_MASK) << 32) |
+                    code.address.ip;
+    uint8_t bytes[CODE_BYTES];
+    for (int i = 0; i < 7; ++i) {
+        bytes[i] = static_cast<uint8_t>(bits >> (48 - i * 8));
+    }
+    bytes[7] = static_cast<uint8_t>(code.address.port >> 8);
+    bytes[8] = static_cast<uint8_t>(code.address.port);
+    bytes[9] = static_cast<uint8_t>(HashBytes(bytes, CODE_BYTES - 1));
 
-class CodeWriter {
-   public:
-    explicit CodeWriter(CodeKind kind) {
-        u8(kind);
-        u8(CODE_VERSION);
-    }
-    void u8(uint8_t v) { myBytes.push_back(v); }
-    void u16(uint16_t v) {
-        u8(static_cast<uint8_t>(v >> 8));
-        u8(static_cast<uint8_t>(v));
-    }
-    void u32(uint32_t v) {
-        u16(static_cast<uint16_t>(v >> 16));
-        u16(static_cast<uint16_t>(v));
-    }
-    void endpoint(const NetEndpoint& ep) {
-        u32(ep.ip);
-        u16(ep.port);
-    }
-    void addresses(const std::vector<uint32_t>& ips) {
-        size_t n = std::min(ips.size(), MAX_CODE_ADDRESSES);
-        u8(static_cast<uint8_t>(n));
-        for (size_t i = 0; i < n; ++i) u32(ips[i]);
-    }
-
-    // Appends the checksum and returns the code text.
-    std::string finish() {
-        u8(static_cast<uint8_t>(HashBytes(myBytes)));
-        std::string text;
-        uint32_t buffer = 0;
-        int bits = 0;
-        for (uint8_t b : myBytes) {
-            buffer = (buffer << 8) | b;
-            bits += 8;
-            while (bits >= 5) {
-                bits -= 5;
-                text.push_back(CODE_ALPHABET[(buffer >> bits) & 31]);
-            }
+    std::string text;
+    uint32_t buffer = 0;
+    int nbits = 0;
+    for (uint8_t b : bytes) {
+        buffer = (buffer << 8) | b;
+        nbits += 8;
+        while (nbits >= 5) {
+            nbits -= 5;
+            if (text.size() % 5 == 4) text.push_back('-');
+            text.push_back(CODE_ALPHABET[(buffer >> nbits) & 31]);
         }
-        if (bits > 0) {
-            text.push_back(CODE_ALPHABET[(buffer << (5 - bits)) & 31]);
-        }
-        std::string grouped;
-        for (size_t i = 0; i < text.size(); ++i) {
-            if (i > 0 && i % 6 == 0) grouped.push_back('-');
-            grouped.push_back(text[i]);
-        }
-        return grouped;
     }
-
-   private:
-    Bytes myBytes;
-};
-
-class CodeReader {
-   public:
-    // Decodes the text; check kind() and ok() afterwards.
-    explicit CodeReader(const std::string& text) {
-        uint32_t buffer = 0;
-        int bits = 0;
-        for (char ch : text) {
-            if (ch == '-' || ch == ' ' || ch == '\t' || ch == '\r' ||
-                ch == '\n') {
-                continue;
-            }
-            char c =
-                static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-            if (c == 'O') c = '0';
-            if (c == 'I' || c == 'L') c = '1';
-            const char* p = c ? strchr(CODE_ALPHABET, c) : nullptr;
-            if (!p) {
-                myOk = false;
-                return;
-            }
-            buffer = (buffer << 5) | static_cast<uint32_t>(p - CODE_ALPHABET);
-            bits += 5;
-            if (bits >= 8) {
-                bits -= 8;
-                myBytes.push_back(static_cast<uint8_t>(buffer >> bits));
-            }
-        }
-        if (myBytes.size() < 3 ||
-            static_cast<uint8_t>(HashBytes(
-                myBytes.data(), myBytes.size() - 1)) != myBytes.back()) {
-            myOk = false;
-            return;
-        }
-        myBytes.pop_back();
-        myKind = u8();
-        myVersion = u8();
-    }
-
-    bool valid() const { return myOk; }
-    bool ok() const { return myOk && myPos == myBytes.size(); }
-    uint8_t kind() const { return myKind; }
-    uint8_t version() const { return myVersion; }
-
-    uint8_t u8() {
-        if (myPos >= myBytes.size()) {
-            myOk = false;
-            return 0;
-        }
-        return myBytes[myPos++];
-    }
-    uint16_t u16() {
-        uint16_t hi = u8();
-        return static_cast<uint16_t>((hi << 8) | u8());
-    }
-    uint32_t u32() {
-        uint32_t hi = u16();
-        return (hi << 16) | u16();
-    }
-    NetEndpoint endpoint() {
-        NetEndpoint ep;
-        ep.ip = u32();
-        ep.port = u16();
-        return ep;
-    }
-    std::vector<uint32_t> addresses() {
-        std::vector<uint32_t> out;
-        uint8_t n = u8();
-        if (n > MAX_CODE_ADDRESSES) myOk = false;
-        for (uint8_t i = 0; i < n && myOk; ++i) out.push_back(u32());
-        return out;
-    }
-
-   private:
-    Bytes myBytes;
-    size_t myPos = 0;
-    uint8_t myKind = 0;
-    uint8_t myVersion = 0;
-    bool myOk = true;
-};
-
-static std::string EncodeJoinCode(const JoinCode& code) {
-    CodeWriter out(CODE_JOIN);
-    out.u32(code.token);
-    out.u16(code.port);
-    out.endpoint(code.stun);
-    out.endpoint(code.upnp);
-    out.addresses(code.lan);
-    return out.finish();
+    return text;
 }
 
-static std::string EncodeReplyCode(const ReplyCode& code) {
-    CodeWriter out(CODE_REPLY);
-    out.u32(code.token);
-    out.u16(code.port);
-    out.endpoint(code.stun);
-    out.addresses(code.lan);
-    return out.finish();
-}
-
-// Returns an error message, or an empty string if the code has the expected
-// kind and version.
-static std::string CheckCode(const CodeReader& in, CodeKind expected) {
-    if (!in.valid()) {
-        return "That is not a valid code; make sure it was copied completely.";
+// Returns an error message, or an empty string if the code is valid and has
+// the expected kind.
+static std::string DecodeCode(const std::string& text, CodeKind expected,
+                              SessionCode& code) {
+    Bytes bytes;
+    uint32_t buffer = 0;
+    int nbits = 0, chars = 0;
+    for (char ch : text) {
+        if (ch == '-' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            continue;
+        }
+        char c =
+            static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        if (c == 'O') c = '0';
+        if (c == 'I' || c == 'L') c = '1';
+        const char* p = c ? strchr(CODE_ALPHABET, c) : nullptr;
+        if (!p) return "That is not a valid code.";
+        buffer = (buffer << 5) | static_cast<uint32_t>(p - CODE_ALPHABET);
+        nbits += 5;
+        if (nbits >= 8) {
+            nbits -= 8;
+            bytes.push_back(static_cast<uint8_t>(buffer >> nbits));
+        }
+        ++chars;
     }
-    if (in.kind() != expected) {
+    if (chars > CODE_CHARS) {
+        return "That code is too long; it may be from an older ArrowVortex "
+               "version.";
+    }
+    if (chars < CODE_CHARS ||
+        static_cast<uint8_t>(HashBytes(bytes.data(), CODE_BYTES - 1)) !=
+            bytes[CODE_BYTES - 1]) {
+        return "That is not a valid code; make sure it was copied correctly.";
+    }
+    uint64_t bits = 0;
+    for (int i = 0; i < 7; ++i) bits = (bits << 8) | bytes[i];
+    if ((bits >> 53) != CODE_VERSION) {
+        return "The code is from a different ArrowVortex version.";
+    }
+    if (((bits >> 52) & 1) != expected) {
         return expected == CODE_JOIN
                    ? "That is a reply code; the host enters it under Reply."
                    : "That is a join code; guests enter it under Join.";
     }
-    if (in.version() != CODE_VERSION) {
-        return "The code is from a different ArrowVortex version.";
-    }
-    return std::string();
-}
-
-static std::string DecodeJoinCode(const std::string& text, JoinCode& code) {
-    CodeReader in(text);
-    std::string error = CheckCode(in, CODE_JOIN);
-    if (!error.empty()) return error;
-    code.token = in.u32();
-    code.port = in.u16();
-    code.stun = in.endpoint();
-    code.upnp = in.endpoint();
-    code.lan = in.addresses();
-    if (!in.ok() || code.port == 0) return "That is not a valid join code.";
-    return std::string();
-}
-
-static std::string DecodeReplyCode(const std::string& text, ReplyCode& code) {
-    CodeReader in(text);
-    std::string error = CheckCode(in, CODE_REPLY);
-    if (!error.empty()) return error;
-    code.token = in.u32();
-    code.port = in.u16();
-    code.stun = in.endpoint();
-    code.lan = in.addresses();
-    if (!in.ok()) return "That is not a valid reply code.";
+    code.token = static_cast<uint32_t>(bits >> 32) & TOKEN_MASK;
+    code.address.ip = static_cast<uint32_t>(bits);
+    code.address.port = static_cast<uint16_t>((bytes[7] << 8) | bytes[8]);
+    bool valid = code.token != 0 && code.address.port != 0 &&
+                 (expected == CODE_JOIN || code.address.ip != 0);
+    if (!valid) return "That is not a valid code.";
     return std::string();
 }
 
@@ -788,30 +674,42 @@ static uint32_t RandomU32() {
     return v;
 }
 
+// A session token that fits in a code.
+static uint32_t RandomToken() {
+    uint32_t v = 0;
+    while (v == 0) v = RandomU32() & TOKEN_MASK;
+    return v;
+}
+
 // How a guest can reach the host, from the join code.
 struct HostAddress {
     uint32_t token = 0;
-    std::vector<NetEndpoint> tcp;  // Tried directly, all at once.
-    std::vector<NetEndpoint> udp;  // Used for hole punching.
+    std::vector<NetEndpoint> tcp;       // Tried directly, all at once.
+    std::vector<NetEndpoint> udp;       // Used for hole punching.
+    std::vector<NetEndpoint> discover;  // Broadcasts to find a LAN host.
 };
 
-static HostAddress ToHostAddress(const JoinCode& code) {
+static HostAddress ToHostAddress(const SessionCode& code) {
+    const auto defaultPort = static_cast<uint16_t>(Session::DEFAULT_PORT);
     HostAddress out;
     out.token = code.token;
-    for (uint32_t ip : code.lan) {
-        AddUnique(out.tcp, {ip, code.port});
-        AddUnique(out.udp, {ip, code.port});
+    // The code has the UPnP or STUN port; also try the default port, in case
+    // it was forwarded by hand and the router changed the STUN port.
+    if (code.address.ip) {
+        AddUnique(out.tcp, code.address);
+        AddUnique(out.tcp, {code.address.ip, defaultPort});
+        AddUnique(out.udp, code.address);
     }
-    // The UPnP port, and the host's port on its public address (in case it
-    // was forwarded by hand).
-    AddUnique(out.tcp, code.upnp);
-    if (code.stun.ip) {
-        AddUnique(out.tcp, {code.stun.ip, code.port});
-        AddUnique(out.tcp, {code.stun.ip, code.upnp.port});
+    // The host's local port is usually the one in the code, or else the
+    // default port. Broadcast to both: to the whole LAN, to each local /24
+    // network (in case the broadcast only leaves on one interface) and to
+    // this computer.
+    std::vector<uint32_t> ips = {0xFFFFFFFF, 0x7F000001};
+    for (uint32_t ip : LocalIps()) ips.push_back(ip | 0xFF);
+    for (uint32_t ip : ips) {
+        AddUnique(out.discover, {ip, code.address.port});
+        AddUnique(out.discover, {ip, defaultPort});
     }
-    AddUnique(out.udp, code.stun);
-    AddUnique(out.udp, code.upnp);
-    if (code.stun.ip) AddUnique(out.udp, {code.stun.ip, code.upnp.port});
     return out;
 }
 
@@ -820,8 +718,9 @@ static HostAddress ToHostAddress(const JoinCode& code) {
 //
 // Connections are either TCP (direct) or a UdpStream over the host's UDP
 // socket (hole punched). The host listens for both on the same port number;
-// a guest first tries every TCP address from the join code at once, while
-// also punching the host's UDP addresses. Whichever works first is used.
+// a guest first tries the TCP addresses from the join code and of hosts that
+// answer its LAN broadcast at once, while also punching the host's UDP
+// address. Whichever works first is used.
 
 struct NetEvent {
     enum Type {
@@ -994,14 +893,20 @@ class NetLink {
             NetSocket socket;
         };
         std::vector<Attempt> attempts;
+        std::vector<NetEndpoint> tried;
         std::string error;
-        for (const auto& ep : host.tcp) {
+        auto tryConnect = [&](const NetEndpoint& ep) {
+            if (std::find(tried.begin(), tried.end(), ep) != tried.end()) {
+                return;
+            }
+            tried.push_back(ep);
             Attempt a;
             a.endpoint = ep;
             if (a.socket.beginConnect(ep, error)) {
                 attempts.push_back(std::move(a));
             }
-        }
+        };
+        for (const auto& ep : host.tcp) tryConnect(ep);
 
         StunClient stun;
         if (udp.isValid()) stun.start();
@@ -1010,7 +915,7 @@ class NetLink {
         uint32_t connection = RandomU32();
         std::vector<NetEndpoint> punchTo = host.udp;
         auto start = Clock::now();
-        Clock::time_point lastPunch;
+        Clock::time_point lastPunch, lastDiscover;
         uint8_t buf[2048];
 
         while (!st.stop_requested()) {
@@ -1052,7 +957,11 @@ class NetLink {
             std::erase_if(attempts,
                           [](const Attempt& a) { return !a.socket.isValid(); });
             if (ElapsedMs(start) > CONNECT_TIMEOUT_MS) attempts.clear();
-            if (attempts.empty() && !directFailed) {
+            // Wait for LAN hosts to answer before giving up on direct
+            // connections.
+            bool discovering =
+                udp.isValid() && ElapsedMs(start) < DISCOVER_TIME_MS;
+            if (attempts.empty() && !discovering && !directFailed) {
                 directFailed = true;
                 if (!udp.isValid()) continue;  // Reports FAILED above.
                 myPush(NetEvent::DIRECT_FAILED, HOST_ID, std::string());
@@ -1067,8 +976,13 @@ class NetLink {
                 UdpStream::Kind kind;
                 uint32_t id;
                 if (!UdpStream::parseHeader(buf, n, kind, id)) continue;
-                if (kind == UdpStream::KIND_PUNCH &&
+                if (kind == UdpStream::KIND_DISCOVER && id == 0 &&
                     PunchToken(buf, n) == host.token) {
+                    // A host on the LAN; it listens for TCP on the same port.
+                    tryConnect(from);
+                    AddUnique(punchTo, from);
+                } else if (kind == UdpStream::KIND_PUNCH &&
+                           PunchToken(buf, n) == host.token) {
                     // The host punches towards us; answer from here so that
                     // its router lets our punches through.
                     AddUnique(punchTo, from);
@@ -1093,6 +1007,14 @@ class NetLink {
             if (!stunReported && stun.isDone()) {
                 stunReported = true;
                 myPushStun(stun);
+            }
+            if (discovering &&
+                ElapsedMs(lastDiscover) >= DISCOVER_INTERVAL_MS) {
+                lastDiscover = Clock::now();
+                for (const auto& ep : host.discover) {
+                    UdpStream::sendPunch(udp, ep, connection, host.token,
+                                         UdpStream::KIND_DISCOVER);
+                }
             }
             // Give direct connections a head start; they are faster.
             bool punch = attempts.empty() || ElapsedMs(start) > PUNCH_DELAY_MS;
@@ -1312,6 +1234,14 @@ class NetLink {
             if (!UdpStream::parseHeader(buf, n, kind, id)) continue;
             Conn* c = myFindStream(conns, from, id);
 
+            if (kind == UdpStream::KIND_DISCOVER) {
+                // Host: a guest on the LAN looking for us.
+                if (isHost && id != 0 && PunchToken(buf, n) == myToken) {
+                    UdpStream::sendPunch(udp, from, 0, myToken,
+                                         UdpStream::KIND_DISCOVER);
+                }
+                continue;
+            }
             if (kind == UdpStream::KIND_PUNCH) {
                 // Host: a guest that knows the token; connect (once) and
                 // tell it so. Punches from a host (id 0) are ignored.
@@ -1503,7 +1433,6 @@ struct SessionImpl : public Session {
     bool myStunDone = false;
     bool mySymmetricNat = false;
     NetEndpoint myPublicAddress;
-    std::vector<uint32_t> myLocalIps;
 
     // Host: how guests can reach us.
     PortMapper myPortMapper;
@@ -1685,14 +1614,13 @@ struct SessionImpl : public Session {
         myHasUdp = udp.openUdp(port, udpError);
         if (!myHasUdp) HudWarning("No hole punching: %s", udpError.c_str());
 
-        myToken = RandomU32();
+        myToken = RandomToken();
         if (!myLink.startHost(std::move(listener), std::move(udp), myToken,
                               error)) {
             HudError("Cannot host: %s", error.c_str());
             return false;
         }
         myPort = port;
-        myLocalIps = LocalIps();
         myHostStart = Clock::now();
         myJoinCode.clear();
         myStunDone = false;
@@ -1717,8 +1645,8 @@ struct SessionImpl : public Session {
         myRejoinPending = false;
         if (!myStartNetworking()) return false;
 
-        JoinCode code;
-        std::string error = DecodeJoinCode(text, code);
+        SessionCode code;
+        std::string error = DecodeCode(text, CODE_JOIN, code);
         if (!error.empty()) {
             HudError("Cannot join: %s", error.c_str());
             return false;
@@ -1752,7 +1680,6 @@ struct SessionImpl : public Session {
 
         myJoinCodeText = text;
         myToken = code.token;
-        myLocalIps = LocalIps();
         myDirectFailed = false;
         myReplyCode.clear();
         myStunDone = false;
@@ -1792,8 +1719,8 @@ struct SessionImpl : public Session {
             HudError("Hole punching is not available (no UDP port).");
             return false;
         }
-        ReplyCode code;
-        std::string error = DecodeReplyCode(text, code);
+        SessionCode code;
+        std::string error = DecodeCode(text, CODE_REPLY, code);
         if (!error.empty()) {
             HudError("%s", error.c_str());
             return false;
@@ -1802,10 +1729,7 @@ struct SessionImpl : public Session {
             HudError("That reply code is for a different session.");
             return false;
         }
-        std::vector<NetEndpoint> targets;
-        AddUnique(targets, code.stun);
-        for (uint32_t ip : code.lan) AddUnique(targets, {ip, code.port});
-        myLink.addPunchTargets(targets);
+        myLink.addPunchTargets({code.address});
         HudInfo("Connecting to the guest...");
         return true;
     }
@@ -1951,16 +1875,20 @@ struct SessionImpl : public Session {
              upnp.state == PortMapper::STATE_PENDING)) {
             return;
         }
-        JoinCode code;
+        // There is room for one address: the UPnP port works for both TCP
+        // and UDP; otherwise guests punch towards the STUN address. Without
+        // either, only LAN guests can join (by broadcast, on our port).
+        SessionCode code;
         code.token = myToken;
-        code.port = static_cast<uint16_t>(myPort);
-        code.stun = myPublicAddress;
-        code.lan = myLocalIps;
         if (myUsableUpnp(upnp)) {
-            code.upnp = upnp.external;
-            if (!code.upnp.ip) code.upnp.ip = myPublicAddress.ip;
+            code.address = upnp.external;
+            if (!code.address.ip) code.address.ip = myPublicAddress.ip;
+        } else if (myPublicAddress.isValid()) {
+            code.address = myPublicAddress;
+        } else {
+            code.address.port = static_cast<uint16_t>(myPort);
         }
-        std::string text = EncodeJoinCode(code);
+        std::string text = EncodeCode(CODE_JOIN, code);
         if (text == myJoinCode) return;
         bool updated = !myJoinCode.empty();
         myJoinCode = text;
@@ -1981,12 +1909,10 @@ struct SessionImpl : public Session {
                 "could not be found (STUN).");
             return;
         }
-        ReplyCode code;
+        SessionCode code;
         code.token = myToken;
-        code.port = myGuestPort;
-        code.stun = myPublicAddress;
-        code.lan = myLocalIps;
-        myReplyCode = EncodeReplyCode(code);
+        code.address = myPublicAddress;
+        myReplyCode = EncodeCode(CODE_REPLY, code);
         HudInfo(
             "Could not reach the host directly. Copy your reply code and send "
             "it to the host.");
