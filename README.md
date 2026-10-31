@@ -1,10 +1,13 @@
 # ArrowVortex Together (Fork)
 
-This version of ArrowVortex has Collaboration features, allowing you to host sessions to step together with your friends. It is up to date with the 1.1.0 release version of ArrowVortex with some extra features, including:
-Mouse Mode
-192nd Sequencing
-Hosting Sessions to invite friends to step together
-Custom Snaps saved to your list of snaps and allows multiple Custom Snaps added at once.
+This version of ArrowVortex has Collaboration features, allowing you to host sessions to step together with your friends. 
+
+It is up to date with the 1.1.0 release version of ArrowVortex with some extra features, including:
+
+- Mouse Mode
+- 192nd Sequencing
+- Hosting Sessions to invite friends to step together
+- Custom Snaps saved to your list of snaps and allows multiple Custom Snaps added at once.
 
 ArrowVortex is a dance game simfile editor. It can be used to create or edit stepfiles for various rhythm games, such as StepMania, ITG, osu!, and other games which support DDR-style and/or PIU-style panel layouts.
 
