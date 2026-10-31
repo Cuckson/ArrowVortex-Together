@@ -1,6 +1,7 @@
 #include <Editor/Session.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -29,6 +31,8 @@
 #include <Editor/History.h>
 #include <Editor/Music.h>
 #include <Editor/NetSocket.h>
+#include <Editor/NetUdp.h>
+#include <Editor/NetUpnp.h>
 #include <Editor/Notefield.h>
 #include <Editor/Selection.h>
 #include <Editor/TextOverlay.h>
@@ -63,7 +67,7 @@ namespace {
 // made them ("origin"). The host is user 0; guests get ids from 1 upwards.
 
 const uint32_t PROTOCOL_MAGIC = 0x504D5641;  // "AVMP"
-const uint16_t PROTOCOL_VERSION = 3;
+const uint16_t PROTOCOL_VERSION = 4;
 const uint32_t MAX_FRAME_SIZE = 64 * 1024 * 1024;
 
 const uint32_t HOST_ID = 0;
@@ -110,6 +114,11 @@ enum SectionType : uint8_t {
 
 const int CONNECT_TIMEOUT_MS = 5000;
 const int POLL_INTERVAL_MS = 20;
+const int STOP_GRACE_MS = 1000;
+const int PUNCH_DELAY_MS = 1500;
+const int PUNCH_INTERVAL_MS = 250;
+const int PUNCH_TIMEOUT_MS = 10 * 60 * 1000;
+const int JOIN_CODE_WAIT_MS = 8000;
 const int PRESENCE_INTERVAL_MS = 33;
 const int SELECTION_INTERVAL_MS = 100;
 
@@ -120,6 +129,7 @@ const uint64_t MAX_OTHER_FILE_SIZE = 32ULL * 1024 * 1024;
 const int REJOIN_TIMEOUT_SECONDS = 120;
 
 typedef std::vector<uint8_t> Bytes;
+typedef std::chrono::steady_clock Clock;
 
 static uint64_t HashBytes(const uint8_t* data, size_t size) {
     // 64-bit FNV-1a.
@@ -525,7 +535,293 @@ static double PixelsPerUnit() {
 }
 
 // ================================================================================================
+// Join and reply codes.
+//
+// A join code tells a guest how to reach the host: the host's LAN addresses,
+// its public address (as seen by a STUN server, and the port forwarded by
+// UPnP, if any) and a random session token. If the guest cannot connect
+// directly, it shows a reply code with its own public address; once the host
+// enters it, both sides send UDP packets to each other until the routers let
+// them through ("hole punching").
+//
+// Code bytes: [u8 kind][u8 version][payload][u8 checksum], written as
+// Crockford base32 in dash-separated groups. Values are big-endian.
+
+enum CodeKind : uint8_t {
+    CODE_JOIN = 1,
+    CODE_REPLY = 2,
+};
+
+const uint8_t CODE_VERSION = 1;
+const size_t MAX_CODE_ADDRESSES = 6;
+const char* const CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+struct JoinCode {
+    uint32_t token = 0;
+    uint16_t port = 0;          // Local TCP/UDP port of the host.
+    NetEndpoint stun;           // Public address of the host's UDP socket.
+    NetEndpoint upnp;           // Router address and forwarded port.
+    std::vector<uint32_t> lan;  // Local addresses of the host.
+};
+
+struct ReplyCode {
+    uint32_t token = 0;
+    uint16_t port = 0;          // Local UDP port of the guest.
+    NetEndpoint stun;           // Public address of the guest's UDP socket.
+    std::vector<uint32_t> lan;  // Local addresses of the guest.
+};
+
+class CodeWriter {
+   public:
+    explicit CodeWriter(CodeKind kind) {
+        u8(kind);
+        u8(CODE_VERSION);
+    }
+    void u8(uint8_t v) { myBytes.push_back(v); }
+    void u16(uint16_t v) {
+        u8(static_cast<uint8_t>(v >> 8));
+        u8(static_cast<uint8_t>(v));
+    }
+    void u32(uint32_t v) {
+        u16(static_cast<uint16_t>(v >> 16));
+        u16(static_cast<uint16_t>(v));
+    }
+    void endpoint(const NetEndpoint& ep) {
+        u32(ep.ip);
+        u16(ep.port);
+    }
+    void addresses(const std::vector<uint32_t>& ips) {
+        size_t n = std::min(ips.size(), MAX_CODE_ADDRESSES);
+        u8(static_cast<uint8_t>(n));
+        for (size_t i = 0; i < n; ++i) u32(ips[i]);
+    }
+
+    // Appends the checksum and returns the code text.
+    std::string finish() {
+        u8(static_cast<uint8_t>(HashBytes(myBytes)));
+        std::string text;
+        uint32_t buffer = 0;
+        int bits = 0;
+        for (uint8_t b : myBytes) {
+            buffer = (buffer << 8) | b;
+            bits += 8;
+            while (bits >= 5) {
+                bits -= 5;
+                text.push_back(CODE_ALPHABET[(buffer >> bits) & 31]);
+            }
+        }
+        if (bits > 0) {
+            text.push_back(CODE_ALPHABET[(buffer << (5 - bits)) & 31]);
+        }
+        std::string grouped;
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (i > 0 && i % 6 == 0) grouped.push_back('-');
+            grouped.push_back(text[i]);
+        }
+        return grouped;
+    }
+
+   private:
+    Bytes myBytes;
+};
+
+class CodeReader {
+   public:
+    // Decodes the text; check kind() and ok() afterwards.
+    explicit CodeReader(const std::string& text) {
+        uint32_t buffer = 0;
+        int bits = 0;
+        for (char ch : text) {
+            if (ch == '-' || ch == ' ' || ch == '\t' || ch == '\r' ||
+                ch == '\n') {
+                continue;
+            }
+            char c =
+                static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (c == 'O') c = '0';
+            if (c == 'I' || c == 'L') c = '1';
+            const char* p = c ? strchr(CODE_ALPHABET, c) : nullptr;
+            if (!p) {
+                myOk = false;
+                return;
+            }
+            buffer = (buffer << 5) | static_cast<uint32_t>(p - CODE_ALPHABET);
+            bits += 5;
+            if (bits >= 8) {
+                bits -= 8;
+                myBytes.push_back(static_cast<uint8_t>(buffer >> bits));
+            }
+        }
+        if (myBytes.size() < 3 ||
+            static_cast<uint8_t>(HashBytes(
+                myBytes.data(), myBytes.size() - 1)) != myBytes.back()) {
+            myOk = false;
+            return;
+        }
+        myBytes.pop_back();
+        myKind = u8();
+        myVersion = u8();
+    }
+
+    bool valid() const { return myOk; }
+    bool ok() const { return myOk && myPos == myBytes.size(); }
+    uint8_t kind() const { return myKind; }
+    uint8_t version() const { return myVersion; }
+
+    uint8_t u8() {
+        if (myPos >= myBytes.size()) {
+            myOk = false;
+            return 0;
+        }
+        return myBytes[myPos++];
+    }
+    uint16_t u16() {
+        uint16_t hi = u8();
+        return static_cast<uint16_t>((hi << 8) | u8());
+    }
+    uint32_t u32() {
+        uint32_t hi = u16();
+        return (hi << 16) | u16();
+    }
+    NetEndpoint endpoint() {
+        NetEndpoint ep;
+        ep.ip = u32();
+        ep.port = u16();
+        return ep;
+    }
+    std::vector<uint32_t> addresses() {
+        std::vector<uint32_t> out;
+        uint8_t n = u8();
+        if (n > MAX_CODE_ADDRESSES) myOk = false;
+        for (uint8_t i = 0; i < n && myOk; ++i) out.push_back(u32());
+        return out;
+    }
+
+   private:
+    Bytes myBytes;
+    size_t myPos = 0;
+    uint8_t myKind = 0;
+    uint8_t myVersion = 0;
+    bool myOk = true;
+};
+
+static std::string EncodeJoinCode(const JoinCode& code) {
+    CodeWriter out(CODE_JOIN);
+    out.u32(code.token);
+    out.u16(code.port);
+    out.endpoint(code.stun);
+    out.endpoint(code.upnp);
+    out.addresses(code.lan);
+    return out.finish();
+}
+
+static std::string EncodeReplyCode(const ReplyCode& code) {
+    CodeWriter out(CODE_REPLY);
+    out.u32(code.token);
+    out.u16(code.port);
+    out.endpoint(code.stun);
+    out.addresses(code.lan);
+    return out.finish();
+}
+
+// Returns an error message, or an empty string if the code has the expected
+// kind and version.
+static std::string CheckCode(const CodeReader& in, CodeKind expected) {
+    if (!in.valid()) {
+        return "That is not a valid code; make sure it was copied completely.";
+    }
+    if (in.kind() != expected) {
+        return expected == CODE_JOIN
+                   ? "That is a reply code; the host enters it under Reply."
+                   : "That is a join code; guests enter it under Join.";
+    }
+    if (in.version() != CODE_VERSION) {
+        return "The code is from a different ArrowVortex version.";
+    }
+    return std::string();
+}
+
+static std::string DecodeJoinCode(const std::string& text, JoinCode& code) {
+    CodeReader in(text);
+    std::string error = CheckCode(in, CODE_JOIN);
+    if (!error.empty()) return error;
+    code.token = in.u32();
+    code.port = in.u16();
+    code.stun = in.endpoint();
+    code.upnp = in.endpoint();
+    code.lan = in.addresses();
+    if (!in.ok() || code.port == 0) return "That is not a valid join code.";
+    return std::string();
+}
+
+static std::string DecodeReplyCode(const std::string& text, ReplyCode& code) {
+    CodeReader in(text);
+    std::string error = CheckCode(in, CODE_REPLY);
+    if (!error.empty()) return error;
+    code.token = in.u32();
+    code.port = in.u16();
+    code.stun = in.endpoint();
+    code.lan = in.addresses();
+    if (!in.ok()) return "That is not a valid reply code.";
+    return std::string();
+}
+
+static void AddUnique(std::vector<NetEndpoint>& list, const NetEndpoint& ep) {
+    if (ep.isValid() && std::find(list.begin(), list.end(), ep) == list.end()) {
+        list.push_back(ep);
+    }
+}
+
+static std::vector<uint32_t> LocalIps() {
+    std::vector<uint32_t> ips;
+    for (const auto& text : NetSocket::localAddresses()) {
+        uint32_t ip = 0;
+        if (NetEndpoint::parseIp(text, ip)) ips.push_back(ip);
+    }
+    return ips;
+}
+
+static uint32_t RandomU32() {
+    std::random_device rd;
+    uint32_t v = 0;
+    while (v == 0) v = rd();
+    return v;
+}
+
+// How a guest can reach the host, from the join code.
+struct HostAddress {
+    uint32_t token = 0;
+    std::vector<NetEndpoint> tcp;  // Tried directly, all at once.
+    std::vector<NetEndpoint> udp;  // Used for hole punching.
+};
+
+static HostAddress ToHostAddress(const JoinCode& code) {
+    HostAddress out;
+    out.token = code.token;
+    for (uint32_t ip : code.lan) {
+        AddUnique(out.tcp, {ip, code.port});
+        AddUnique(out.udp, {ip, code.port});
+    }
+    // The UPnP port, and the host's port on its public address (in case it
+    // was forwarded by hand).
+    AddUnique(out.tcp, code.upnp);
+    if (code.stun.ip) {
+        AddUnique(out.tcp, {code.stun.ip, code.port});
+        AddUnique(out.tcp, {code.stun.ip, code.upnp.port});
+    }
+    AddUnique(out.udp, code.stun);
+    AddUnique(out.udp, code.upnp);
+    if (code.stun.ip) AddUnique(out.udp, {code.stun.ip, code.upnp.port});
+    return out;
+}
+
+// ================================================================================================
 // NetLink: owns the worker thread and the message queues.
+//
+// Connections are either TCP (direct) or a UdpStream over the host's UDP
+// socket (hole punched). The host listens for both on the same port number;
+// a guest first tries every TCP address from the join code at once, while
+// also punching the host's UDP addresses. Whichever works first is used.
 
 struct NetEvent {
     enum Type {
@@ -533,24 +829,35 @@ struct NetEvent {
         LOST,       // A peer connection ended.
         FAILED,     // Connecting failed (guest).
         FRAME,      // A complete frame was received; data = [type][payload].
+        STUN_DONE,  // The public UDP address is known (or not found).
+        DIRECT_FAILED,  // Guest: no direct connection; hole punching only.
     };
     Type type = FRAME;
     uint32_t peer = 0;
     Bytes data;
     std::string text;
+    NetEndpoint endpoint;  // STUN_DONE: public address (invalid if unknown).
+    bool flag = false;     // STUN_DONE: symmetric NAT. CONNECTED: via UDP.
 };
 
 class NetLink {
    public:
     ~NetLink() { stop(); }
 
-    // Host: accepts any number of peers, with ids starting at 1.
-    bool startHost(NetSocket listener, std::string& error) {
+    // Host: accepts any number of peers, with ids starting at 1. The UDP
+    // socket (optional) is used for STUN and hole punched connections from
+    // guests that know the token.
+    bool startHost(NetSocket listener, NetSocket udp, uint32_t token,
+                   std::string& error) {
         stop();
         try {
-            myThread = std::jthread(
-                [this, l = std::move(listener)](std::stop_token st) mutable {
-                    myRun(st, &l, nullptr);
+            myThread =
+                std::jthread([this, l = std::move(listener), u = std::move(udp),
+                              token](std::stop_token st) mutable {
+                    myToken = token;
+                    StunClient stun;
+                    if (u.isValid()) stun.start();
+                    myRun(st, &l, u.isValid() ? &u : nullptr, stun, {});
                 });
         } catch (const std::system_error& e) {
             error = e.what();
@@ -560,12 +867,15 @@ class NetLink {
     }
 
     // Guest: connects to the host, which gets peer id HOST_ID.
-    bool startGuest(const std::string& host, int port, std::string& error) {
+    bool startGuest(HostAddress host, NetSocket udp, std::string& error) {
         stop();
         try {
-            myThread = std::jthread([this, host, port](std::stop_token st) {
-                myGuestLoop(st, host, port);
-            });
+            myThread =
+                std::jthread([this, h = std::move(host),
+                              u = std::move(udp)](std::stop_token st) mutable {
+                    myToken = h.token;
+                    myGuestLoop(st, h, u);
+                });
         } catch (const std::system_error& e) {
             error = e.what();
             return false;
@@ -583,6 +893,7 @@ class NetLink {
         myInbox.clear();
         myOutbox.clear();
         myDrops.clear();
+        myNewTargets.clear();
     }
 
     void send(uint32_t peer, Bytes frame) {
@@ -594,6 +905,12 @@ class NetLink {
     void dropPeer(uint32_t peer) {
         std::lock_guard<std::mutex> lock(myMutex);
         myDrops.push_back(peer);
+    }
+
+    // Host: starts punching towards a guest (from its reply code).
+    void addPunchTargets(const std::vector<NetEndpoint>& targets) {
+        std::lock_guard<std::mutex> lock(myMutex);
+        myNewTargets.insert(myNewTargets.end(), targets.begin(), targets.end());
     }
 
     bool poll(NetEvent& out) {
@@ -612,52 +929,186 @@ class NetLink {
 
     struct Conn {
         uint32_t id = 0;
-        NetSocket socket;
+        NetSocket socket;                   // TCP connections.
+        std::unique_ptr<UdpStream> stream;  // Hole punched connections.
         Bytes readBuf, writeBuf;
         size_t writePos = 0;
         bool dropping = false;
-        int dropTicks = 0;
+        Clock::time_point dropTime;
 
-        bool hasPendingWrites() const { return writePos < writeBuf.size(); }
+        bool hasPendingWrites() const {
+            if (stream) return stream->hasPendingWrites();
+            return writePos < writeBuf.size();
+        }
     };
+
+    // Host: an address a guest's reply code asked us to punch towards.
+    struct PunchTarget {
+        NetEndpoint endpoint;
+        Clock::time_point expires;
+    };
+
+    void myPush(NetEvent evt) {
+        std::lock_guard<std::mutex> lock(myMutex);
+        myInbox.push_back(std::move(evt));
+    }
 
     void myPush(NetEvent::Type type, uint32_t peer, std::string text) {
         NetEvent evt;
         evt.type = type;
         evt.peer = peer;
         evt.text = std::move(text);
-        std::lock_guard<std::mutex> lock(myMutex);
-        myInbox.push_back(std::move(evt));
+        myPush(std::move(evt));
     }
 
-    void myGuestLoop(const std::stop_token& st, const std::string& host,
-                     int port) {
-        NetSocket sock;
+    void myPushStun(const StunClient& stun) {
+        NetEvent evt;
+        evt.type = NetEvent::STUN_DONE;
+        evt.endpoint = stun.getResult();
+        evt.flag = stun.isSymmetric();
+        myPush(std::move(evt));
+    }
+
+    static int ElapsedMs(Clock::time_point since) {
+        return static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                                  since)
+                .count());
+    }
+
+    static uint32_t PunchToken(const uint8_t* data, int size) {
+        if (size < UdpStream::HEADER_SIZE + 4) return 0;
+        const uint8_t* p = data + UdpStream::HEADER_SIZE;
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
+    }
+
+    // Tries all direct addresses and hole punching at the same time, then
+    // runs the connection that worked.
+    void myGuestLoop(const std::stop_token& st, const HostAddress& host,
+                     NetSocket& udp) {
+        struct Attempt {
+            NetEndpoint endpoint;
+            NetSocket socket;
+        };
+        std::vector<Attempt> attempts;
         std::string error;
-        if (!sock.beginConnect(host, port, error)) {
-            myPush(NetEvent::FAILED, HOST_ID, error);
-            return;
-        }
-        bool connected = false;
-        for (int waited = 0; waited < CONNECT_TIMEOUT_MS && !connected;
-             waited += 50) {
-            if (st.stop_requested()) return;
-            int flags = sock.poll(true, 50);
-            if (flags & (NetSocket::POLL_WRITE | NetSocket::POLL_ERROR)) {
-                if (!sock.finishConnect(error)) {
-                    myPush(NetEvent::FAILED, HOST_ID, error);
-                    return;
-                }
-                connected = true;
+        for (const auto& ep : host.tcp) {
+            Attempt a;
+            a.endpoint = ep;
+            if (a.socket.beginConnect(ep, error)) {
+                attempts.push_back(std::move(a));
             }
         }
-        if (!connected) {
-            myPush(NetEvent::FAILED, HOST_ID,
-                   std::format("Timed out connecting to {}:{}.", host, port));
-            return;
+
+        StunClient stun;
+        if (udp.isValid()) stun.start();
+        bool stunReported = false;
+        bool directFailed = false;
+        uint32_t connection = RandomU32();
+        std::vector<NetEndpoint> punchTo = host.udp;
+        auto start = Clock::now();
+        Clock::time_point lastPunch;
+        uint8_t buf[2048];
+
+        while (!st.stop_requested()) {
+            std::vector<NetSocket::PollItem> items;
+            for (auto& a : attempts) items.push_back({&a.socket, true, 0});
+            if (udp.isValid()) items.push_back({&udp, false, 0});
+            if (items.empty()) {
+                myPush(NetEvent::FAILED, HOST_ID,
+                       "Could not reach the host. " + error);
+                return;
+            }
+            if (!NetSocket::pollAll(items, POLL_INTERVAL_MS)) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(POLL_INTERVAL_MS));
+            }
+
+            // Direct connections.
+            for (size_t i = 0; i < attempts.size(); ++i) {
+                if (!(items[i].result &
+                      (NetSocket::POLL_WRITE | NetSocket::POLL_ERROR))) {
+                    continue;
+                }
+                if (attempts[i].socket.finishConnect(error)) {
+                    NetEvent evt;
+                    evt.type = NetEvent::CONNECTED;
+                    evt.peer = HOST_ID;
+                    evt.text = attempts[i].endpoint.toString();
+                    myPush(std::move(evt));
+                    std::vector<Conn> conns(1);
+                    conns[0].id = HOST_ID;
+                    conns[0].socket = std::move(attempts[i].socket);
+                    attempts.clear();
+                    udp.close();
+                    myRun(st, nullptr, nullptr, stun, std::move(conns));
+                    return;
+                }
+                attempts[i].socket.close();
+            }
+            std::erase_if(attempts,
+                          [](const Attempt& a) { return !a.socket.isValid(); });
+            if (ElapsedMs(start) > CONNECT_TIMEOUT_MS) attempts.clear();
+            if (attempts.empty() && !directFailed) {
+                directFailed = true;
+                if (!udp.isValid()) continue;  // Reports FAILED above.
+                myPush(NetEvent::DIRECT_FAILED, HOST_ID, std::string());
+            }
+            if (!udp.isValid()) continue;
+
+            // Hole punching.
+            NetEndpoint from;
+            int n;
+            while ((n = udp.recvFrom(buf, sizeof(buf), from)) > 0) {
+                if (stun.onPacket(buf, n, from)) continue;
+                UdpStream::Kind kind;
+                uint32_t id;
+                if (!UdpStream::parseHeader(buf, n, kind, id)) continue;
+                if (kind == UdpStream::KIND_PUNCH &&
+                    PunchToken(buf, n) == host.token) {
+                    // The host punches towards us; answer from here so that
+                    // its router lets our punches through.
+                    AddUnique(punchTo, from);
+                    UdpStream::sendPunch(udp, from, connection, host.token);
+                } else if (kind == UdpStream::KIND_ACCEPT && id == connection) {
+                    NetEvent evt;
+                    evt.type = NetEvent::CONNECTED;
+                    evt.peer = HOST_ID;
+                    evt.text = from.toString();
+                    evt.flag = true;
+                    myPush(std::move(evt));
+                    std::vector<Conn> conns(1);
+                    conns[0].id = HOST_ID;
+                    conns[0].stream =
+                        std::make_unique<UdpStream>(connection, from);
+                    attempts.clear();
+                    myRun(st, nullptr, &udp, stun, std::move(conns));
+                    return;
+                }
+            }
+            stun.update(udp);
+            if (!stunReported && stun.isDone()) {
+                stunReported = true;
+                myPushStun(stun);
+            }
+            // Give direct connections a head start; they are faster.
+            bool punch = attempts.empty() || ElapsedMs(start) > PUNCH_DELAY_MS;
+            if (punch && ElapsedMs(lastPunch) >= PUNCH_INTERVAL_MS) {
+                lastPunch = Clock::now();
+                for (const auto& ep : punchTo) {
+                    UdpStream::sendPunch(udp, ep, connection, host.token);
+                }
+            }
+            if (ElapsedMs(start) > PUNCH_TIMEOUT_MS) {
+                myPush(NetEvent::FAILED, HOST_ID,
+                       "Timed out waiting for the host to accept the reply "
+                       "code.");
+                return;
+            }
         }
-        myPush(NetEvent::CONNECTED, HOST_ID, std::string());
-        myRun(st, nullptr, &sock);
     }
 
     static Conn* myFind(std::vector<Conn>& conns, uint32_t id) {
@@ -667,53 +1118,99 @@ class NetLink {
         return nullptr;
     }
 
-    // Moves frames between the sockets and the queues. With a listener, new
-    // connections are accepted until stopped; otherwise the loop ends when the
-    // single connection ends.
-    void myRun(const std::stop_token& st, NetSocket* listener,
-               NetSocket* single) {
-        std::vector<Conn> conns;
-        if (single) {
-            Conn c;
-            c.id = HOST_ID;
-            c.socket = std::move(*single);
-            conns.push_back(std::move(c));
+    static Conn* myFindStream(std::vector<Conn>& conns, const NetEndpoint& from,
+                              uint32_t connection) {
+        for (auto& c : conns) {
+            if (c.stream && c.stream->getPeer() == from &&
+                c.stream->getConnection() == connection) {
+                return &c;
+            }
         }
+        return nullptr;
+    }
+
+    static void myClose(Conn& c, NetSocket* udp) {
+        if (c.stream && udp) {
+            for (int i = 0; i < 2; ++i) {
+                UdpStream::sendControl(*udp, c.stream->getPeer(),
+                                       UdpStream::KIND_CLOSE,
+                                       c.stream->getConnection());
+            }
+        }
+    }
+
+    // Moves frames between the connections and the queues. With a listener,
+    // new connections are accepted until stopped; otherwise the loop ends
+    // when the single connection ends.
+    void myRun(const std::stop_token& st, NetSocket* listener, NetSocket* udp,
+               StunClient& stun, std::vector<Conn> conns) {
         uint32_t nextId = HOST_ID + 1;
         Bytes chunk(1 << 16);
-        int stopTicks = 0;
+        bool stopping = false;
+        Clock::time_point stopTime;
+        bool stunReported = !listener || !udp;
+        std::vector<PunchTarget> targets;
+        Clock::time_point lastPunch;
 
         while (true) {
-            // Collect outgoing frames and drop requests.
+            // Collect outgoing frames, drop requests and punch targets.
             {
                 std::lock_guard<std::mutex> lock(myMutex);
                 for (auto& out : myOutbox) {
                     Conn* c = myFind(conns, out.peer);
-                    if (c && !c->dropping) {
+                    if (!c || c->dropping) continue;
+                    if (c->stream) {
+                        c->stream->write(out.frame.data(), out.frame.size());
+                    } else {
                         c->writeBuf.insert(c->writeBuf.end(), out.frame.begin(),
                                            out.frame.end());
                     }
                 }
                 myOutbox.clear();
                 for (uint32_t id : myDrops) {
-                    if (Conn* c = myFind(conns, id)) c->dropping = true;
+                    Conn* c = myFind(conns, id);
+                    if (c && !c->dropping) {
+                        c->dropping = true;
+                        c->dropTime = Clock::now();
+                    }
                 }
                 myDrops.clear();
+                for (const auto& ep : myNewTargets) {
+                    auto expires = Clock::now() +
+                                   std::chrono::milliseconds(PUNCH_TIMEOUT_MS);
+                    auto it = std::find_if(
+                        targets.begin(), targets.end(),
+                        [&](const PunchTarget& t) { return t.endpoint == ep; });
+                    if (it != targets.end()) {
+                        it->expires = expires;
+                    } else {
+                        targets.push_back({ep, expires});
+                    }
+                }
+                myNewTargets.clear();
             }
 
             // On stop, close once everything is sent (or after a short grace
             // period).
             if (st.stop_requested()) {
+                if (!stopping) {
+                    stopping = true;
+                    stopTime = Clock::now();
+                }
                 bool pending = std::any_of(
                     conns.begin(), conns.end(),
                     [](const Conn& c) { return c.hasPendingWrites(); });
-                if (!pending || ++stopTicks > 10) return;
+                if (!pending || ElapsedMs(stopTime) > STOP_GRACE_MS) {
+                    for (auto& c : conns) myClose(c, udp);
+                    return;
+                }
             }
 
             // Close dropped connections once their frames are sent.
             for (auto it = conns.begin(); it != conns.end();) {
-                if (it->dropping &&
-                    (!it->hasPendingWrites() || ++it->dropTicks > 10)) {
+                if (it->dropping && (!it->hasPendingWrites() ||
+                                     ElapsedMs(it->dropTime) > STOP_GRACE_MS)) {
+                    myClose(*it, udp);
                     myPush(NetEvent::LOST, it->id, "Connection closed.");
                     it = conns.erase(it);
                 } else {
@@ -724,8 +1221,14 @@ class NetLink {
 
             std::vector<NetSocket::PollItem> items;
             if (listener) items.push_back({listener, false, 0});
-            for (auto& c : conns) {
-                items.push_back({&c.socket, c.hasPendingWrites(), 0});
+            if (udp) items.push_back({udp, false, 0});
+            size_t first = items.size();
+            std::vector<size_t> tcpConns;
+            for (size_t i = 0; i < conns.size(); ++i) {
+                if (conns[i].stream) continue;
+                tcpConns.push_back(i);
+                items.push_back(
+                    {&conns[i].socket, conns[i].hasPendingWrites(), 0});
             }
             if (!NetSocket::pollAll(items, POLL_INTERVAL_MS)) {
                 std::this_thread::sleep_for(
@@ -733,18 +1236,51 @@ class NetLink {
                 continue;
             }
 
-            size_t first = listener ? 1 : 0;
             std::vector<std::pair<uint32_t, std::string>> lost;
-            for (size_t i = 0; i < conns.size(); ++i) {
+            for (size_t i = 0; i < tcpConns.size(); ++i) {
+                Conn& c = conns[tcpConns[i]];
                 std::string reason =
-                    myService(conns[i], items[first + i].result, chunk);
-                if (!reason.empty()) lost.emplace_back(conns[i].id, reason);
+                    myService(c, items[first + i].result, chunk);
+                if (!reason.empty()) lost.emplace_back(c.id, reason);
+            }
+            if (udp) {
+                myServiceUdp(*udp, listener != nullptr, conns, nextId, stun,
+                             lost);
             }
             for (auto& [id, reason] : lost) {
-                conns.erase(std::find_if(
+                auto it = std::find_if(
                     conns.begin(), conns.end(),
-                    [id = id](const Conn& c) { return c.id == id; }));
+                    [id = id](const Conn& c) { return c.id == id; });
+                if (it == conns.end()) continue;
+                myClose(*it, udp);
+                conns.erase(it);
                 myPush(NetEvent::LOST, id, reason);
+            }
+
+            if (udp) {
+                // Host: punch towards guests that sent a reply code, until
+                // they are connected.
+                if (ElapsedMs(lastPunch) >= PUNCH_INTERVAL_MS) {
+                    lastPunch = Clock::now();
+                    std::erase_if(targets, [](const PunchTarget& t) {
+                        return Clock::now() > t.expires;
+                    });
+                    for (const auto& t : targets) {
+                        bool connected = std::any_of(
+                            conns.begin(), conns.end(), [&](const Conn& c) {
+                                return c.stream &&
+                                       c.stream->getPeer() == t.endpoint;
+                            });
+                        if (!connected) {
+                            UdpStream::sendPunch(*udp, t.endpoint, 0, myToken);
+                        }
+                    }
+                }
+                stun.update(*udp);
+                if (!stunReported && stun.isDone()) {
+                    stunReported = true;
+                    myPushStun(stun);
+                }
             }
 
             if (listener && (items[0].result & NetSocket::POLL_READ)) {
@@ -756,6 +1292,70 @@ class NetLink {
                     conns.push_back(std::move(c));
                     myPush(NetEvent::CONNECTED, conns.back().id, std::string());
                 }
+            }
+        }
+    }
+
+    // Reads all pending datagrams, and updates the hole punched connections.
+    void myServiceUdp(NetSocket& udp, bool isHost, std::vector<Conn>& conns,
+                      uint32_t& nextId, StunClient& stun,
+                      std::vector<std::pair<uint32_t, std::string>>& lost) {
+        uint8_t buf[2048];
+        NetEndpoint from;
+        int n;
+        for (int count = 0;
+             count < 4096 && (n = udp.recvFrom(buf, sizeof(buf), from)) > 0;
+             ++count) {
+            if (stun.onPacket(buf, n, from)) continue;
+            UdpStream::Kind kind;
+            uint32_t id;
+            if (!UdpStream::parseHeader(buf, n, kind, id)) continue;
+            Conn* c = myFindStream(conns, from, id);
+
+            if (kind == UdpStream::KIND_PUNCH) {
+                // Host: a guest that knows the token; connect (once) and
+                // tell it so. Punches from a host (id 0) are ignored.
+                if (!isHost || id == 0 || PunchToken(buf, n) != myToken) {
+                    continue;
+                }
+                if (!c) {
+                    Conn conn;
+                    conn.id = nextId++;
+                    conn.stream = std::make_unique<UdpStream>(id, from);
+                    conns.push_back(std::move(conn));
+                    c = &conns.back();
+                    NetEvent evt;
+                    evt.type = NetEvent::CONNECTED;
+                    evt.peer = c->id;
+                    evt.text = from.toString();
+                    evt.flag = true;
+                    myPush(std::move(evt));
+                }
+                c->stream->onAlive();
+                UdpStream::sendControl(udp, from, UdpStream::KIND_ACCEPT, id);
+                continue;
+            }
+            if (!c) continue;
+            if (kind == UdpStream::KIND_CLOSE) {
+                lost.emplace_back(c->id,
+                                  "The other side closed the connection.");
+                continue;
+            }
+            if (kind == UdpStream::KIND_DATA || kind == UdpStream::KIND_ACK) {
+                c->stream->onPacket(kind, buf + UdpStream::HEADER_SIZE,
+                                    n - UdpStream::HEADER_SIZE, c->readBuf);
+                if (!myParseFrames(c->id, c->readBuf)) {
+                    lost.emplace_back(c->id, "Protocol error.");
+                }
+            } else {
+                c->stream->onAlive();
+            }
+        }
+        for (auto& c : conns) {
+            if (!c.stream) continue;
+            c.stream->update(udp);
+            if (c.stream->isDead()) {
+                lost.emplace_back(c.id, "Connection timed out.");
             }
         }
     }
@@ -817,12 +1417,12 @@ class NetLink {
     std::deque<NetEvent> myInbox;
     std::deque<Outgoing> myOutbox;
     std::vector<uint32_t> myDrops;
+    std::vector<NetEndpoint> myNewTargets;
+    uint32_t myToken = 0;  // Only used by the worker thread.
 };
 
 // ================================================================================================
 // SessionImpl.
-
-typedef std::chrono::steady_clock Clock;
 
 struct Presence {
     uint32_t chart = 0;
@@ -896,8 +1496,28 @@ struct SessionImpl : public Session {
     uint32_t myId = HOST_ID;
 
     std::string myAddress;
-    std::string myShareAddress;
-    std::string myOtherAddresses;
+
+    // Session token from the join code; guests must know it to connect.
+    uint32_t myToken = 0;
+    // The public address of our UDP socket, as seen by a STUN server.
+    bool myStunDone = false;
+    bool mySymmetricNat = false;
+    NetEndpoint myPublicAddress;
+    std::vector<uint32_t> myLocalIps;
+
+    // Host: how guests can reach us.
+    PortMapper myPortMapper;
+    int myPort = 0;
+    bool myHasUdp = false;
+    Clock::time_point myHostStart;
+    std::string myJoinCode;
+
+    // Guest: the join code, our UDP port (kept when joining again, so that
+    // the host's punches still reach us) and the reply code for the host.
+    std::string myJoinCodeText;
+    uint16_t myGuestPort = 0;
+    bool myDirectFailed = false;
+    std::string myReplyCode;
 
     const Simfile* mySimfile = nullptr;
     SongInfo mySong;
@@ -935,7 +1555,7 @@ struct SessionImpl : public Session {
     // Guest: song download, and the join that follows it.
     std::unique_ptr<Download> myDownload;
     bool myRejoinPending = false;
-    std::string myRejoinAddress;
+    std::string myRejoinCode;
     Clock::time_point myRejoinDeadline;
 
     // ================================================================================================
@@ -1058,21 +1678,27 @@ struct SessionImpl : public Session {
             HudError("Cannot host: %s", error.c_str());
             return false;
         }
+        // UDP on the same port, for STUN and hole punching. Hosting works
+        // without it, but only for guests that can connect directly.
+        NetSocket udp;
+        std::string udpError;
+        myHasUdp = udp.openUdp(port, udpError);
+        if (!myHasUdp) HudWarning("No hole punching: %s", udpError.c_str());
 
-        auto addresses = NetSocket::localAddresses();
-        std::string portStr = std::to_string(port);
-        myShareAddress =
-            (addresses.empty() ? std::string("127.0.0.1") : addresses[0]) +
-            ":" + portStr;
-        myOtherAddresses.clear();
-        for (size_t i = 1; i < addresses.size(); ++i) {
-            myOtherAddresses += " " + addresses[i] + ":" + portStr;
-        }
-
-        if (!myLink.startHost(std::move(listener), error)) {
+        myToken = RandomU32();
+        if (!myLink.startHost(std::move(listener), std::move(udp), myToken,
+                              error)) {
             HudError("Cannot host: %s", error.c_str());
             return false;
         }
+        myPort = port;
+        myLocalIps = LocalIps();
+        myHostStart = Clock::now();
+        myJoinCode.clear();
+        myStunDone = false;
+        mySymmetricNat = false;
+        myPublicAddress = NetEndpoint();
+        myPortMapper.start(port);
 
         myRole = ROLE_HOST;
         myState = STATE_LISTENING;
@@ -1082,28 +1708,19 @@ struct SessionImpl : public Session {
         myResetSyncState();
         myAssignChartIds();
         myStoreSectionHashes();
-        HudInfo("Hosting session at %s", myShareAddress.c_str());
+        HudInfo("Hosting session; preparing the join code...");
         return true;
     }
 
-    bool join(const std::string& address) override {
+    bool join(const std::string& text) override {
         disconnect();
         myRejoinPending = false;
         if (!myStartNetworking()) return false;
 
-        std::string hostName = address;
-        int port = DEFAULT_PORT;
-        auto colon = address.rfind(':');
-        if (colon != std::string::npos) {
-            hostName = address.substr(0, colon);
-            port = std::atoi(address.c_str() + colon + 1);
-        }
-        while (!hostName.empty() && hostName.front() == ' ') {
-            hostName.erase(0, 1);
-        }
-        while (!hostName.empty() && hostName.back() == ' ') hostName.pop_back();
-        if (hostName.empty() || port <= 0 || port > 65535) {
-            HudError("Enter the host address as ip:port.");
+        JoinCode code;
+        std::string error = DecodeJoinCode(text, code);
+        if (!error.empty()) {
+            HudError("Cannot join: %s", error.c_str());
             return false;
         }
 
@@ -1114,25 +1731,40 @@ struct SessionImpl : public Session {
             return false;
         }
         // Without the song, the guest downloads it from the host.
-        std::string error;
         mySong = SongInfo();
         const Simfile* sim = gSimfile->get();
         if (sim && !sim->music.empty() && !GetLocalSongInfo(mySong, error)) {
             HudError("Cannot join: %s", error.c_str());
             return false;
         }
-        if (!myLink.startGuest(hostName, port, error)) {
+        // Reuse the previous UDP port if possible: when joining again after a
+        // download, the host still punches towards it.
+        NetSocket udp;
+        if (!udp.openUdp(myGuestPort, error) &&
+            (myGuestPort == 0 || !udp.openUdp(0, error))) {
+            HudWarning("No hole punching: %s", error.c_str());
+        }
+        if (udp.isValid()) myGuestPort = udp.localEndpoint().port;
+        if (!myLink.startGuest(ToHostAddress(code), std::move(udp), error)) {
             HudError("Cannot join: %s", error.c_str());
             return false;
         }
 
-        myAddress = hostName + ":" + std::to_string(port);
+        myJoinCodeText = text;
+        myToken = code.token;
+        myLocalIps = LocalIps();
+        myDirectFailed = false;
+        myReplyCode.clear();
+        myStunDone = false;
+        mySymmetricNat = false;
+        myPublicAddress = NetEndpoint();
+        myAddress = "the host";
         myRole = ROLE_GUEST;
         myState = STATE_CONNECTING;
         mySimfile = gSimfile->get();
         myHasState = false;
         myResetSyncState();
-        HudInfo("Connecting to %s...", myAddress.c_str());
+        HudInfo("Connecting to the host...");
         return true;
     }
 
@@ -1149,6 +1781,33 @@ struct SessionImpl : public Session {
         }
         myEndSession();
         HudInfo("Session ended.");
+    }
+
+    bool acceptReply(const std::string& text) override {
+        if (myRole != ROLE_HOST) {
+            HudError("Only the host can accept reply codes.");
+            return false;
+        }
+        if (!myHasUdp) {
+            HudError("Hole punching is not available (no UDP port).");
+            return false;
+        }
+        ReplyCode code;
+        std::string error = DecodeReplyCode(text, code);
+        if (!error.empty()) {
+            HudError("%s", error.c_str());
+            return false;
+        }
+        if (code.token != myToken) {
+            HudError("That reply code is for a different session.");
+            return false;
+        }
+        std::vector<NetEndpoint> targets;
+        AddUnique(targets, code.stun);
+        for (uint32_t ip : code.lan) AddUnique(targets, {ip, code.port});
+        myLink.addPunchTargets(targets);
+        HudInfo("Connecting to the guest...");
+        return true;
     }
 
     void kick(uint32_t id) override {
@@ -1177,6 +1836,9 @@ struct SessionImpl : public Session {
 
     void myEndSession() {
         myLink.stop();
+        myPortMapper.stop();
+        myJoinCode.clear();
+        myReplyCode.clear();
         myDownload.reset();
         myRole = ROLE_NONE;
         myState = STATE_IDLE;
@@ -1203,18 +1865,28 @@ struct SessionImpl : public Session {
             case STATE_IDLE:
                 return "Not connected.";
             case STATE_LISTENING: {
+                if (myJoinCode.empty()) {
+                    return "Hosting. Preparing the join code (UPnP, STUN)...";
+                }
                 if (myPeers.empty()) {
-                    return "Hosting, waiting for guests." +
-                           (myOtherAddresses.empty()
-                                ? std::string()
-                                : " Other addresses:" + myOtherAddresses);
+                    return "Hosting, waiting for guests. " + myReachability();
                 }
                 return std::format("Hosting, {} guest{}: {}", myPeers.size(),
                                    myPeers.size() == 1 ? "" : "s",
                                    myUserList());
             }
             case STATE_CONNECTING:
-                return "Connecting to " + myAddress + "...";
+                if (!myDirectFailed) return "Connecting to the host...";
+                if (!myReplyCode.empty()) {
+                    return "No direct connection. Send your reply code to the "
+                           "host.";
+                }
+                if (!myStunDone) {
+                    return "No direct connection. Finding your public "
+                           "address...";
+                }
+                return "Could not reach the host, and your public address "
+                       "is unknown.";
             case STATE_HANDSHAKE:
                 return "Verifying song...";
             case STATE_DOWNLOADING: {
@@ -1234,8 +1906,93 @@ struct SessionImpl : public Session {
         return std::string();
     }
 
-    std::string getShareAddress() const override {
-        return myRole == ROLE_HOST ? myShareAddress : std::string();
+    std::string getJoinCode() const override {
+        return myRole == ROLE_HOST ? myJoinCode : std::string();
+    }
+
+    std::string getReplyCode() const override {
+        return myRole == ROLE_GUEST && myState == STATE_CONNECTING
+                   ? myReplyCode
+                   : std::string();
+    }
+
+    // Host: describes how guests on the internet can reach us.
+    std::string myReachability() const {
+        auto upnp = myPortMapper.getResult();
+        if (myUsableUpnp(upnp)) {
+            return std::format("UPnP forwarded port {}.", upnp.external.port);
+        }
+        if (!myPublicAddress.isValid()) {
+            return "Public address unknown; only LAN guests can join.";
+        }
+        if (mySymmetricNat) {
+            return "No UPnP, and your router may block hole punching.";
+        }
+        return "No UPnP; guests may need to send a reply code.";
+    }
+
+    // A UPnP mapping on a router that is itself behind another NAT does not
+    // help guests on the internet.
+    bool myUsableUpnp(const PortMapper::Result& upnp) const {
+        if (upnp.state != PortMapper::STATE_MAPPED) return false;
+        uint32_t ip = upnp.external.ip ? upnp.external.ip : myPublicAddress.ip;
+        return ip != 0 && !NetEndpoint::isPrivateIp(ip);
+    }
+
+    // Host: builds the join code once STUN and UPnP are done (or took too
+    // long). It is updated if UPnP finishes later.
+    void myUpdateJoinCode() {
+        auto upnp = myPortMapper.getResult();
+        auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          Clock::now() - myHostStart)
+                          .count();
+        if (waited < JOIN_CODE_WAIT_MS &&
+            ((myHasUdp && !myStunDone) ||
+             upnp.state == PortMapper::STATE_PENDING)) {
+            return;
+        }
+        JoinCode code;
+        code.token = myToken;
+        code.port = static_cast<uint16_t>(myPort);
+        code.stun = myPublicAddress;
+        code.lan = myLocalIps;
+        if (myUsableUpnp(upnp)) {
+            code.upnp = upnp.external;
+            if (!code.upnp.ip) code.upnp.ip = myPublicAddress.ip;
+        }
+        std::string text = EncodeJoinCode(code);
+        if (text == myJoinCode) return;
+        bool updated = !myJoinCode.empty();
+        myJoinCode = text;
+        if (updated) {
+            HudInfo("The join code was updated.");
+        } else {
+            HudInfo("Hosting session. %s", myReachability().c_str());
+        }
+    }
+
+    // Guest: shows the reply code once direct connections failed and our
+    // public address is known.
+    void myUpdateReplyCode() {
+        if (!myDirectFailed || !myStunDone || !myReplyCode.empty()) return;
+        if (!myPublicAddress.isValid()) {
+            HudError(
+                "Could not reach the host directly, and your public address "
+                "could not be found (STUN).");
+            return;
+        }
+        ReplyCode code;
+        code.token = myToken;
+        code.port = myGuestPort;
+        code.stun = myPublicAddress;
+        code.lan = myLocalIps;
+        myReplyCode = EncodeReplyCode(code);
+        HudInfo(
+            "Could not reach the host directly. Copy your reply code and send "
+            "it to the host.");
+        if (mySymmetricNat) {
+            HudWarning("Your router may block hole punching.");
+        }
     }
 
     const std::vector<Peer>& getPeers() const override { return myPeers; }
@@ -1804,6 +2561,7 @@ struct SessionImpl : public Session {
             }
         }
         if (myRole == ROLE_NONE) return;
+        if (myRole == ROLE_HOST) myUpdateJoinCode();
 
         mySendPresence();
         mySendSelection();
@@ -1887,6 +2645,7 @@ struct SessionImpl : public Session {
             in.read(guestSong.audioHash);
             in.read(guestSong.duration);
         }
+        uint32_t token = in.read<uint32_t>();
 
         std::string reason;
         int numJoined = 0;
@@ -1898,6 +2657,8 @@ struct SessionImpl : public Session {
                 "Protocol version mismatch (host {}, guest {}). Use the same "
                 "ArrowVortex version.",
                 PROTOCOL_VERSION, version);
+        } else if (token != myToken) {
+            reason = "Invalid join code.";
         } else if (numJoined >= MAX_GUESTS) {
             reason = "The session is full.";
         }
@@ -2058,7 +2819,13 @@ struct SessionImpl : public Session {
             case NetEvent::LOST:
                 myRemovePeer(evt.peer, "left the session.");
                 return;
+            case NetEvent::STUN_DONE:
+                myStunDone = true;
+                myPublicAddress = evt.endpoint;
+                mySymmetricNat = evt.flag;
+                return;
             case NetEvent::FAILED:
+            case NetEvent::DIRECT_FAILED:
                 return;
             case NetEvent::FRAME:
                 break;
@@ -2123,8 +2890,20 @@ struct SessionImpl : public Session {
 
     void myHandleGuestEvent(NetEvent& evt) {
         switch (evt.type) {
+            case NetEvent::STUN_DONE:
+                myStunDone = true;
+                myPublicAddress = evt.endpoint;
+                mySymmetricNat = evt.flag;
+                myUpdateReplyCode();
+                return;
+            case NetEvent::DIRECT_FAILED:
+                myDirectFailed = true;
+                myUpdateReplyCode();
+                return;
             case NetEvent::CONNECTED: {
                 myState = STATE_HANDSHAKE;
+                myAddress = evt.text + (evt.flag ? " (hole punched)" : "");
+                myReplyCode.clear();
                 WriteStream out;
                 out.write<uint32_t>(PROTOCOL_MAGIC);
                 out.write<uint16_t>(PROTOCOL_VERSION);
@@ -2132,6 +2911,7 @@ struct SessionImpl : public Session {
                 out.write<uint8_t>(mySong.hasSong ? 1 : 0);
                 out.write<uint64_t>(mySong.audioHash);
                 out.write<double>(mySong.duration);
+                out.write<uint32_t>(myToken);
                 mySendTo(HOST_ID, MSG_HELLO, out);
                 return;
             }
@@ -2352,7 +3132,7 @@ struct SessionImpl : public Session {
         }
 
         // Rejoin once the song is open and its music is loaded.
-        std::string address = myAddress;
+        std::string code = myJoinCodeText;
         std::string folder = pathToUtf8(d.dir);
         mySendDisconnect(HOST_ID, "Downloaded the song.");
         myEndSession();
@@ -2374,7 +3154,7 @@ struct SessionImpl : public Session {
             }
         }
         myRejoinPending = true;
-        myRejoinAddress = address;
+        myRejoinCode = code;
         myRejoinDeadline =
             Clock::now() + std::chrono::seconds(REJOIN_TIMEOUT_SECONDS);
     }
@@ -2389,7 +3169,7 @@ struct SessionImpl : public Session {
         }
         if (gMusic->getSamples().isCompleted()) {
             myRejoinPending = false;
-            join(myRejoinAddress);
+            join(myRejoinCode);
             return;
         }
         if (Clock::now() > myRejoinDeadline) {

@@ -12,6 +12,8 @@ list(APPEND INC
 	"Minimap.h"
 	"Music.h"
 	"NetSocket.h"
+	"NetUdp.h"
+	"NetUpnp.h"
 	"Notefield.h"
 	"NotefieldPreview.h"
 	"RatingEstimator.h"
@@ -44,6 +46,8 @@ list(APPEND SRC
 	"Minimap.cpp"
 	"Music.cpp"
 	"NetSocket.cpp"
+	"NetUdp.cpp"
+	"NetUpnp.cpp"
 	"Notefield.cpp"
 	"NotefieldPreview.cpp"
 	"RatingEstimator.cpp"
@@ -64,7 +68,7 @@ target_include_directories(Editor PRIVATE ${FFMPEG_INCLUDE_DIRS})
 target_link_directories(Editor PRIVATE ${FFMPEG_LIBRARY_DIRS})
 target_link_libraries(Editor PRIVATE Core Dialogs MAD::MAD Managers Simfile System Aubio::aubio iir::iir_static Vorbis::vorbisfile Vorbis::vorbis Ogg::ogg ${FFMPEG_LIBRARIES} SDL3::SDL3)
 if(WIN32)
-    target_link_libraries(Editor PRIVATE ws2_32)
+    target_link_libraries(Editor PRIVATE ws2_32 iphlpapi)
 else()
     # The multiplayer session runs its sockets on a std::jthread.
     find_package(Threads REQUIRED)

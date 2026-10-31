@@ -10,7 +10,11 @@ namespace Vortex {
 
 /// Peer-to-peer co-editing session between one host and any number of guests.
 ///
-/// Guests connect to the host directly, and the host relays every change to
+/// The host shares a join code that holds its LAN and public addresses (found
+/// with STUN; the port is forwarded with UPnP when the router allows it).
+/// Guests try all of them directly; if none works, the guest shows a reply
+/// code that the host enters, and both sides punch a hole through their
+/// routers over UDP. The host relays every change to
 /// the other guests. When a guest joins, its simfile is replaced by the host's
 /// (metadata, timing and all charts). A guest that does not have the host's
 /// song open first downloads the music and simfile to "saves/<song folder>"
@@ -75,11 +79,15 @@ struct Session {
     /// Called by the editor when changes were made to the simfile.
     virtual void onChanges(int changes) = 0;
 
-    /// Starts hosting a session on the given port.
+    /// Starts hosting a session on the given port (TCP and UDP).
     virtual bool host(int port) = 0;
 
-    /// Joins a session at the given "address:port".
-    virtual bool join(const std::string& address) = 0;
+    /// Joins the session of the given join code.
+    virtual bool join(const std::string& code) = 0;
+
+    /// Host: connects to a guest that could not connect directly, using the
+    /// reply code the guest got.
+    virtual bool acceptReply(const std::string& code) = 0;
 
     /// Ends the current session, if any.
     virtual void disconnect() = 0;
@@ -97,8 +105,12 @@ struct Session {
     /// Returns a human readable description of the session state.
     virtual std::string getStatus() const = 0;
 
-    /// Returns the address(es) a guest can use to join, when hosting.
-    virtual std::string getShareAddress() const = 0;
+    /// Host: returns the code guests use to join, once it is ready.
+    virtual std::string getJoinCode() const = 0;
+
+    /// Guest: returns the code to send to the host when the host could not be
+    /// reached directly; empty otherwise.
+    virtual std::string getReplyCode() const = 0;
 
     /// Returns the other users in the session.
     virtual const std::vector<Peer>& getPeers() const = 0;

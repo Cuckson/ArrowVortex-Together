@@ -20,6 +20,7 @@ class DialogCollaborate : public EditorDialog {
     void myCreateWidgets();
     void onHost();
     void onJoin();
+    void onAccept();
     void onCopy();
     void onDisconnect();
     void onNameChanged();
@@ -28,8 +29,9 @@ class DialogCollaborate : public EditorDialog {
 
     std::string myName;
     std::string myPort;
-    std::string myJoinAddress;
-    std::string myShareAddress;
+    std::string myJoinCode;
+    std::string myReplyCode;
+    std::string myCode;
     std::string myStatus;
 
     WgDroplist* myGuestList = nullptr;

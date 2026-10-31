@@ -21,10 +21,10 @@ DialogCollaborate::DialogCollaborate() {
 }
 
 void DialogCollaborate::myCreateWidgets() {
-    myLayout.row().col(320);
+    myLayout.row().col(400);
     myLayout.add<WgLabel>()->text.bind(&myStatus);
 
-    myLayout.row().col(64).col(176).col(72);
+    myLayout.row().col(72).col(248).col(80);
 
     WgLineEdit* name = myLayout.add<WgLineEdit>("Name");
     name->text.bind(&myName);
@@ -37,33 +37,51 @@ void DialogCollaborate::myCreateWidgets() {
     port->text.bind(&myPort);
     port->setNumerical(true);
     port->setMaxLength(5);
-    port->setTooltip("Port to listen on; it must be reachable by the guest");
+    port->setTooltip(
+        "Port to host on (TCP and UDP). It is forwarded automatically with "
+        "UPnP if your router allows it");
 
     WgButton* host = myLayout.add<WgButton>();
     host->text.set("Host");
     host->onPress.bind(this, &DialogCollaborate::onHost);
     host->setTooltip("Start a session with the current song");
 
-    WgLineEdit* share = myLayout.add<WgLineEdit>("Share");
-    share->text.bind(&myShareAddress);
-    share->setEditable(false);
-    share->setTooltip("Give this address to the guest");
+    WgLineEdit* code = myLayout.add<WgLineEdit>("Your code");
+    code->text.bind(&myCode);
+    code->setEditable(false);
+    code->setTooltip(
+        "Host: the join code to give to guests.\n"
+        "Guest: if the host could not be reached directly, the reply code to "
+        "send back to the host");
 
     WgButton* copy = myLayout.add<WgButton>();
     copy->text.set("Copy");
     copy->onPress.bind(this, &DialogCollaborate::onCopy);
 
-    WgLineEdit* join = myLayout.add<WgLineEdit>("Join");
-    join->text.bind(&myJoinAddress);
-    join->setTooltip("Host address, as ip:port");
+    WgLineEdit* join = myLayout.add<WgLineEdit>("Join code");
+    join->text.bind(&myJoinCode);
+    join->setTooltip("The join code you got from the host");
 
     WgButton* joinButton = myLayout.add<WgButton>();
     joinButton->text.set("Join");
     joinButton->onPress.bind(this, &DialogCollaborate::onJoin);
     joinButton->setTooltip(
-        "Join a session. Your simfile is replaced by the host's. If you don't "
-        "have the host's song open, it is downloaded to the \"saves\" "
-        "folder first");
+        "Join a session (pastes the join code from the clipboard if the field "
+        "is empty). Your simfile is replaced by the host's. If you don't have "
+        "the host's song open, it is downloaded to the \"saves\" folder "
+        "first");
+
+    WgLineEdit* reply = myLayout.add<WgLineEdit>("Reply code");
+    reply->text.bind(&myReplyCode);
+    reply->setTooltip(
+        "Host: the reply code of a guest that could not connect directly");
+
+    WgButton* accept = myLayout.add<WgButton>();
+    accept->text.set("Accept");
+    accept->onPress.bind(this, &DialogCollaborate::onAccept);
+    accept->setTooltip(
+        "Connect to the guest through both routers (UDP hole punching). "
+        "Pastes the reply code from the clipboard if the field is empty");
 
     myGuestList = myLayout.add<WgDroplist>("Guest");
     myGuestList->value.bind(&myGuestIndex);
@@ -74,7 +92,7 @@ void DialogCollaborate::myCreateWidgets() {
     kick->onPress.bind(this, &DialogCollaborate::onKick);
     kick->setTooltip("Remove the selected guest from the session");
 
-    myLayout.row().col(320);
+    myLayout.row().col(400);
     WgButton* disconnect = myLayout.add<WgButton>();
     disconnect->text.set("Disconnect");
     disconnect->onPress.bind(this, &DialogCollaborate::onDisconnect);
@@ -82,7 +100,9 @@ void DialogCollaborate::myCreateWidgets() {
 
 void DialogCollaborate::onTick() {
     myStatus = gSession->getStatus();
-    myShareAddress = gSession->getShareAddress();
+    myCode = gSession->getRole() == Session::ROLE_HOST
+                 ? gSession->getJoinCode()
+                 : gSession->getReplyCode();
     myUpdateGuestList();
     EditorDialog::onTick();
 }
@@ -138,12 +158,24 @@ void DialogCollaborate::onHost() {
 
 void DialogCollaborate::onJoin() {
     gSession->setUserName(myName);
-    gSession->join(myJoinAddress);
+    if (myJoinCode.empty()) myJoinCode = GuiMain::getClipboardText();
+    gSession->join(myJoinCode);
+}
+
+void DialogCollaborate::onAccept() {
+    if (myReplyCode.empty()) myReplyCode = GuiMain::getClipboardText();
+    if (gSession->acceptReply(myReplyCode)) myReplyCode.clear();
 }
 
 void DialogCollaborate::onCopy() {
-    std::string address = gSession->getShareAddress();
-    if (!address.empty()) GuiMain::setClipboardText(address);
+    if (myCode.empty()) {
+        HudNote(gSession->getRole() == Session::ROLE_HOST
+                    ? "The join code is not ready yet."
+                    : "There is no code to copy.");
+        return;
+    }
+    GuiMain::setClipboardText(myCode);
+    HudNote("Copied the code to the clipboard.");
 }
 
 void DialogCollaborate::onDisconnect() { gSession->disconnect(); }

@@ -8,7 +8,13 @@
 #define NOMINMAX
 #endif
 #include <winsock2.h>
+#include <mstcpip.h>
 #include <ws2tcpip.h>
+// iphlpapi.h needs the winsock headers first.
+#include <iphlpapi.h>
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -21,6 +27,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cerrno>
+#include <fstream>
+#include <sstream>
 #endif
 
 #include <algorithm>
@@ -82,6 +90,61 @@ static std::string ErrorText(const char* what) {
     return std::string(what) + " (" + ErrorText(LastError()) + ")";
 }
 
+static sockaddr_in ToSockAddr(const NetEndpoint& ep) {
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(ep.ip);
+    addr.sin_port = htons(ep.port);
+    return addr;
+}
+
+static NetEndpoint FromSockAddr(const sockaddr_in& addr) {
+    NetEndpoint ep;
+    ep.ip = ntohl(addr.sin_addr.s_addr);
+    ep.port = ntohs(addr.sin_port);
+    return ep;
+}
+
+// ================================================================================================
+// NetEndpoint.
+
+std::string NetEndpoint::ipToString(uint32_t ip) {
+    return std::to_string((ip >> 24) & 0xFF) + "." +
+           std::to_string((ip >> 16) & 0xFF) + "." +
+           std::to_string((ip >> 8) & 0xFF) + "." + std::to_string(ip & 0xFF);
+}
+
+std::string NetEndpoint::toString() const {
+    return ipToString(ip) + ":" + std::to_string(port);
+}
+
+bool NetEndpoint::parseIp(const std::string& text, uint32_t& out) {
+    in_addr addr = {};
+    if (inet_pton(AF_INET, text.c_str(), &addr) != 1) return false;
+    out = ntohl(addr.s_addr);
+    return true;
+}
+
+bool NetEndpoint::resolve(const std::string& host, int port, NetEndpoint& out) {
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    addrinfo* list = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &list) != 0 || !list) {
+        return false;
+    }
+    out = FromSockAddr(*reinterpret_cast<const sockaddr_in*>(list->ai_addr));
+    out.port = static_cast<uint16_t>(port);
+    freeaddrinfo(list);
+    return true;
+}
+
+bool NetEndpoint::isPrivateIp(uint32_t ip) {
+    uint32_t a = ip >> 24, b = (ip >> 16) & 0xFF;
+    return a == 10 || a == 127 || a == 0 || (a == 172 && b >= 16 && b < 32) ||
+           (a == 192 && b == 168) || (a == 100 && b >= 64 && b < 128) ||
+           (a == 169 && b == 254);
+}
+
 // ================================================================================================
 // Library setup.
 
@@ -138,6 +201,57 @@ std::vector<std::string> NetSocket::localAddresses() {
         AddAddress(out, it->ai_addr);
     }
     freeaddrinfo(list);
+    return out;
+}
+
+std::vector<uint32_t> NetSocket::defaultGateways() {
+    std::vector<uint32_t> out;
+#ifdef _WIN32
+    ULONG size = 16 * 1024;
+    std::vector<uint8_t> buffer;
+    ULONG res = ERROR_BUFFER_OVERFLOW;
+    for (int i = 0; i < 3 && res == ERROR_BUFFER_OVERFLOW; ++i) {
+        buffer.resize(size);
+        res = GetAdaptersAddresses(
+            AF_INET,
+            GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST |
+                GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()),
+            &size);
+    }
+    if (res != NO_ERROR) return out;
+    for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()); a;
+         a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+        for (auto* g = a->FirstGatewayAddress; g; g = g->Next) {
+            const sockaddr* addr = g->Address.lpSockaddr;
+            if (!addr || addr->sa_family != AF_INET) continue;
+            NetEndpoint ep =
+                FromSockAddr(*reinterpret_cast<const sockaddr_in*>(addr));
+            if (ep.ip &&
+                std::find(out.begin(), out.end(), ep.ip) == out.end()) {
+                out.push_back(ep.ip);
+            }
+        }
+    }
+#else
+    // Default routes have destination 0; addresses are in network order.
+    std::ifstream routes("/proc/net/route");
+    std::string line;
+    std::getline(routes, line);  // Header.
+    while (std::getline(routes, line)) {
+        std::istringstream fields(line);
+        std::string iface, dest, gateway;
+        if (!(fields >> iface >> dest >> gateway) || dest != "00000000") {
+            continue;
+        }
+        uint32_t ip =
+            ntohl(static_cast<uint32_t>(std::stoul(gateway, nullptr, 16)));
+        if (ip && std::find(out.begin(), out.end(), ip) == out.end()) {
+            out.push_back(ip);
+        }
+    }
+#endif
     return out;
 }
 
@@ -220,7 +334,7 @@ void NetSocket::close() {
     }
 }
 
-void NetSocket::mySetNonBlocking() {
+void NetSocket::mySetNonBlocking(bool tcp) {
 #ifdef _WIN32
     u_long mode = 1;
     ioctlsocket(ToNative(myHandle), FIONBIO, &mode);
@@ -228,6 +342,7 @@ void NetSocket::mySetNonBlocking() {
     int flags = fcntl(ToNative(myHandle), F_GETFL, 0);
     fcntl(ToNative(myHandle), F_SETFL, flags | O_NONBLOCK);
 #endif
+    if (!tcp) return;
     // Note edits are tiny; send them immediately.
     int noDelay = 1;
     setsockopt(ToNative(myHandle), IPPROTO_TCP, TCP_NODELAY,
@@ -269,7 +384,109 @@ bool NetSocket::listen(int port, std::string& error) {
         close();
         return false;
     }
-    mySetNonBlocking();
+    mySetNonBlocking(true);
+    return true;
+}
+
+bool NetSocket::openUdp(int port, std::string& error) {
+    close();
+    myHandle = FromNative(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    if (!isValid()) {
+        error = ErrorText("Could not create socket");
+        return false;
+    }
+#ifdef _WIN32
+    // Without this, an ICMP "port unreachable" makes the next recvfrom fail
+    // with WSAECONNRESET, which happens all the time while hole punching.
+    BOOL reportReset = FALSE;
+    DWORD bytes = 0;
+    WSAIoctl(ToNative(myHandle), SIO_UDP_CONNRESET, &reportReset,
+             sizeof(reportReset), nullptr, 0, &bytes, nullptr, nullptr);
+#endif
+    // Song downloads arrive in bursts; give them some room.
+    int bufferSize = 1 << 20;
+    setsockopt(ToNative(myHandle), SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
+    setsockopt(ToNative(myHandle), SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
+
+    sockaddr_in addr = ToSockAddr({0, static_cast<uint16_t>(port)});
+    if (bind(ToNative(myHandle), reinterpret_cast<sockaddr*>(&addr),
+             sizeof(addr)) != 0) {
+        error = ErrorText(
+            ("Could not bind UDP port " + std::to_string(port)).c_str());
+        close();
+        return false;
+    }
+    mySetNonBlocking(false);
+    return true;
+}
+
+int NetSocket::sendTo(const void* data, int size, const NetEndpoint& to) {
+    sockaddr_in addr = ToSockAddr(to);
+#ifdef _WIN32
+    int res = ::sendto(ToNative(myHandle), static_cast<const char*>(data), size,
+                       0, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+#else
+    int res = static_cast<int>(
+        ::sendto(ToNative(myHandle), data, size, MSG_NOSIGNAL,
+                 reinterpret_cast<sockaddr*>(&addr), sizeof(addr)));
+#endif
+    if (res < 0) return IsWouldBlock(LastError()) ? 0 : -1;
+    return res;
+}
+
+int NetSocket::recvFrom(void* data, int size, NetEndpoint& from) {
+    sockaddr_in addr = {};
+    SockLen len = sizeof(addr);
+#ifdef _WIN32
+    int res = ::recvfrom(ToNative(myHandle), static_cast<char*>(data), size, 0,
+                         reinterpret_cast<sockaddr*>(&addr), &len);
+#else
+    int res =
+        static_cast<int>(::recvfrom(ToNative(myHandle), data, size, 0,
+                                    reinterpret_cast<sockaddr*>(&addr), &len));
+#endif
+    if (res < 0) {
+        int err = LastError();
+#ifdef _WIN32
+        // Oversized datagrams and stray ICMP errors are not fatal.
+        if (err == WSAEMSGSIZE || err == WSAECONNRESET) return 0;
+#else
+        if (err == ECONNREFUSED) return 0;
+#endif
+        return IsWouldBlock(err) ? 0 : -1;
+    }
+    from = FromSockAddr(addr);
+    return res;
+}
+
+NetEndpoint NetSocket::localEndpoint() const {
+    sockaddr_in addr = {};
+    SockLen len = sizeof(addr);
+    if (getsockname(ToNative(myHandle), reinterpret_cast<sockaddr*>(&addr),
+                    &len) != 0) {
+        return NetEndpoint();
+    }
+    return FromSockAddr(addr);
+}
+
+bool NetSocket::beginConnect(const NetEndpoint& to, std::string& error) {
+    close();
+    myHandle = FromNative(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+    if (!isValid()) {
+        error = ErrorText("Could not create socket");
+        return false;
+    }
+    mySetNonBlocking(true);
+    sockaddr_in addr = ToSockAddr(to);
+    int res = ::connect(ToNative(myHandle), reinterpret_cast<sockaddr*>(&addr),
+                        sizeof(addr));
+    if (res != 0 && !IsWouldBlock(LastError())) {
+        error = ErrorText("Could not connect");
+        close();
+        return false;
+    }
     return true;
 }
 
@@ -294,7 +511,7 @@ bool NetSocket::beginConnect(const std::string& host, int port,
         error = ErrorText("Could not create socket");
         return false;
     }
-    mySetNonBlocking();
+    mySetNonBlocking(true);
 
     int res = ::connect(ToNative(myHandle), list->ai_addr,
                         static_cast<SockLen>(list->ai_addrlen));
@@ -322,7 +539,7 @@ bool NetSocket::finishConnect(std::string& error) {
 NetSocket NetSocket::accept() {
     NativeSocket s = ::accept(ToNative(myHandle), nullptr, nullptr);
     NetSocket out(FromNative(s));
-    if (out.isValid()) out.mySetNonBlocking();
+    if (out.isValid()) out.mySetNonBlocking(true);
     return out;
 }
 
